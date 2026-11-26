@@ -1,12 +1,15 @@
 edition 7;
 module ssh_cipher;
+import std.aes;
 import std.chacha20;
+import std.gcm;
 import ssh_wire as wire;
 
-// `ssh_cipher` -- `chacha20-poly1305@openssh.com` (OpenSSH's PROTOCOL.chacha20poly1305), one packet at a time and in
-// place, and the generator the package draws its random bytes from (`docs/design.md` sections 2 and 3).
+// `ssh_cipher` -- the two ciphers, one packet at a time and in place, and the generator the package draws its random
+// bytes from (`docs/design.md` sections 2 and 3). `chacha20-poly1305@openssh.com` (OpenSSH's
+// PROTOCOL.chacha20poly1305) is first; `aes256-gcm@openssh.com` is further down.
 //
-// A key is 64 bytes: the first 32 encrypt the packet (K_2), the last 32 encrypt its length (K_1). The nonce is the
+// A ChaCha20-Poly1305 key is 64 bytes: the first 32 encrypt the packet (K_2), the last 32 encrypt its length (K_1). The nonce is the
 // packet's sequence number. This is the original ChaCha, 64 bits of counter and 64 of nonce, written on
 // `std.chacha20`'s RFC 8439 layout (32 and 96): the four bytes in front of the sequence number are the high half of
 // a counter that never reaches them.
@@ -95,6 +98,83 @@ pub fn open[&k, &b](key: &k [byte], seq: int, buf: &!b [byte]) -> [] int {
         }
     }
     if diff != 0 {
+        return wire.bad_mac();
+    }
+    return 0;
+}
+
+// ---- aes256-gcm@openssh.com ----
+//
+// RFC 5647 as OpenSSH uses it: the packet's length is sent in the clear and is the additional data, the rest is
+// AES-256-GCM, and the 12-byte nonce is four fixed bytes and a counter of eight that goes up by one a packet (it
+// is not the sequence number). Software only: `std.gcm`'s own `prepare` asks the CPU for its AES instructions, a
+// question that is refused on the bare target (`docs/design.md` section 3), so the key is prepared here, into the
+// layout `std.gcm`'s software functions read, and `tests/cipher_test.cho` holds that layout to a reference vector.
+
+pub fn gcm_context_len() -> [] int {
+    return gcm.context_len();
+}
+
+fn rev32(x0: int) -> [] int {
+    var x = x0;
+    x = (x & 0x55555555) << 1 | x >> 1 & 0x55555555;
+    x = (x & 0x33333333) << 2 | x >> 2 & 0x33333333;
+    x = (x & 0x0f0f0f0f) << 4 | x >> 4 & 0x0f0f0f0f;
+    x = (x & 0x00ff00ff) << 8 | x >> 8 & 0x00ff00ff;
+    return (x << 16 | x >> 16) & 0xffffffff;
+}
+
+// The 32-byte `key`, prepared into `ctx` (`gcm_context_len()` words): the rounds, the expanded key, then
+// H = AES(K, 0) as four words, the last the most significant, and those four with their bits reversed.
+pub fn gcm_prepare[&k, &c](key: &k [byte], ctx: &!c [int]) -> [] int {
+    let h = 1 + aes.skey_len();
+    ctx[0] = aes.rounds(32);
+    aes.expand(key[0..32], ctx[1..h]);
+    region r {
+        let block = alloc_slice[r](16, byte_of(0));
+        aes.encrypt_block(ctx[0], ctx[1..h], block, block);
+        var i = 0;
+        while i < 4 {
+            ctx[h + 3 - i] = wire.u32_at(block, 4 * i);
+            i = i + 1;
+        }
+        i = 0;
+        while i < 4 {
+            ctx[h + 4 + i] = rev32(ctx[h + i]);
+            i = i + 1;
+        }
+        i = 0;
+        while i < 16 {
+            block[i] = byte_of(0);
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// The nonce's counter, its last eight bytes, one more: after every packet, sealed or opened.
+pub fn gcm_next[&n](nonce: &!n [byte]) -> [] int {
+    var i = 11;
+    var carry = 1;
+    while i >= 4 {
+        let v = int_of(nonce[i]) + carry;
+        nonce[i] = byte_of(v & 255);
+        carry = v >> 8;
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Seals the packet in `buf`: four bytes of length, the bytes it counts, 16 bytes of room. The length stays in the
+// clear.
+pub fn gcm_seal[&c, &n, &b](ctx: &c [int], nonce: &n [byte], buf: &!b [byte]) -> [] int {
+    return gcm.seal_in_place_software(ctx, nonce[0..12], buf[0..4], buf[4..len(buf)]);
+}
+
+// Opens the packet in `buf`: four bytes of length, the encrypted bytes it counts, the tag. 0, or `bad_mac` and
+// nothing was decrypted.
+pub fn gcm_open[&c, &n, &b](ctx: &c [int], nonce: &n [byte], buf: &!b [byte]) -> [] int {
+    if gcm.open_in_place_software(ctx, nonce[0..12], buf[0..4], buf[4..len(buf)]) != 0 {
         return wire.bad_mac();
     }
     return 0;

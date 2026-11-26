@@ -46,7 +46,7 @@ connection as it has room. With SSH between, the same function becomes the loop 
   line, and to the three `cancho test` lines only if a test wants them. (`cancho add`, [`design.md`](design.md)
   section 9, is the other way, and needs the kernel to have a `cancho.toml`, which it does not **[read]**.)
 - **Memory.** The shell's region holds its buffers already, about 12 KB **[read]**. A connection is
-  `ssh.ints_len()` words (1,024 bytes) and `ssh.bytes_len(4096)` bytes (9,288), or 17,480 for packets of 8,192. A
+  `ssh.ints_len()` words (386, so 3,088 bytes) and `ssh.bytes_len(4096)` bytes (9,296), or 17,488 for packets of 8,192. A
   region is one 64 KiB chunk, so both fit beside what is there; if they come not to, a second region inside the
   first is the way.
 - **Authority.** The package holds no capability and `session` holds none **[read]**, so `./authority.sh` should

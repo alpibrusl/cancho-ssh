@@ -12,8 +12,10 @@ import os
 import socket
 import sys
 
+from cryptography.exceptions import InvalidTag
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from minissh import Client, Closed, Reader, load_key, new_key, string, u32  # noqa: E402
+from minissh import GCM, Client, Closed, Reader, load_key, new_key, string, u32  # noqa: E402
 from sshd_fixture import Server  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,13 +37,13 @@ def main():
     with Server(ROOT) as server:
         good = load_key(server.identity)
 
-        def case(name, tag, act, logged_in=False, strict=True):
+        def case(name, tag, act, logged_in=False, strict=True, cipher=None):
             """Runs `act(client)` on a fresh connection and checks that the server ended it with `tag`."""
             global count
             count += 1
             problem = ""
             try:
-                c = Client(server.port, strict=strict)
+                c = Client(server.port, strict=strict, **({"cipher": cipher} if cipher else {}))
                 c.hello()
                 if logged_in:
                     c.exchange()
@@ -49,7 +51,7 @@ def main():
                 act(c)
                 c.closed()
                 c.sock.close()
-            except (Closed, ConnectionError, socket.timeout):
+            except (Closed, ConnectionError, socket.timeout, InvalidTag):
                 pass
             except Exception as e:  # noqa: BLE001
                 problem = repr(e)
@@ -103,6 +105,47 @@ def main():
             from minissh import chacha
             c.raw(chacha(k1, 0, c.send_seq, u32(0x7ffffff8)) + bytes(64))
         case("a sealed length of two gigabytes", "ssh-packet-too-large", huge_claim)
+
+        # ---- with keys: the other cipher ----
+        def gcm_flipped(c):
+            c.exchange()
+            sealed = bytearray(c.seal(bytes([5]) + string(b"ssh-userauth")))
+            sealed[9] ^= 0x10
+            c.raw(bytes(sealed))
+        case("AES-GCM: a sealed packet with one bit changed", "ssh-bad-mac", gcm_flipped, cipher=GCM)
+
+        def gcm_length(c):
+            # The length is in the clear and is authenticated: a packet claiming to be one block shorter.
+            c.exchange()
+            sealed = bytearray(c.seal(bytes([2]) + string(b"x" * 40)))
+            sealed[3] -= 16
+            c.raw(bytes(sealed))
+        case("AES-GCM: a changed length", "ssh-bad-mac", gcm_length, cipher=GCM)
+
+        def gcm_replayed(c):
+            c.exchange()
+            sealed = c.seal(bytes([2]) + string(b"ignore me"))
+            c.raw(sealed)
+            c.raw(sealed)
+        case("AES-GCM: a sealed packet sent twice", "ssh-bad-mac", gcm_replayed, cipher=GCM)
+
+        def gcm_stuck_nonce(c):
+            # A client that seals two packets under one nonce, which is what GCM must never see.
+            c.exchange()
+            c.raw(c.seal(bytes([2]) + string(b"first"), step=False))
+            c.raw(c.seal(bytes([2]) + string(b"second")))
+        case("AES-GCM: a nonce used twice", "ssh-bad-mac", gcm_stuck_nonce, cipher=GCM)
+
+        def gcm_session(c):
+            c.open_session()
+            c.request(b"shell")
+            c.expect(99)
+            for i in range(3):
+                c.exchange()
+                c.data(b"echo gcm after re-key %d\n" % i)
+                assert c.read_data(b"\n") == b"gcm after re-key %d\n" % i
+            c.send(bytes([1]) + u32(11) + string(b"") + string(b""))
+        case("AES-GCM: a login, a shell and three re-keys", "ssh-peer-disconnected", gcm_session, logged_in=True, cipher=GCM)
 
         # ---- with keys: authentication ----
         case("a service that does not exist", "ssh-unknown-service", lambda c: (c.exchange(), c.send(bytes([5]) + string(b"ssh-connection"))))

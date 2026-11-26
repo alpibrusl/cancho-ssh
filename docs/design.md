@@ -35,7 +35,8 @@ So three things are decided here:
 1. **The package owns no socket, clock, file or heap** (section 2). It is given bytes and gives bytes back.
 2. **The package carries its own SHA-256** (`src/sha256.cho`), the software path of `std.crypto` with nothing else.
    When `std.crypto.sha256` builds for the bare target this file goes away **[choice]**.
-3. **One algorithm of each kind** (section 3), chosen so that everything else is already in `std`.
+3. **One algorithm of each kind, and a second cipher** (section 3), chosen so that everything else is already in
+   `std`.
 
 ## 2. The shape: bytes in, bytes out
 
@@ -90,24 +91,35 @@ hardware generator. **A host that passes a constant has no security at all**, an
 |---|---|---|
 | key exchange | `curve25519-sha256`, `curve25519-sha256@libssh.org` (the same thing) | everything else |
 | host key | `ssh-ed25519` | RSA, ECDSA |
-| cipher | `chacha20-poly1305@openssh.com` | AES-GCM, AES-CTR with a MAC |
+| cipher | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com` | AES-128-GCM, AES-CTR with a MAC |
 | compression | `none` | zlib |
 | user authentication | `publickey` with `ssh-ed25519` | passwords, keyboard-interactive, host-based |
 | channels | one `session` at a time: `pty-req`, `shell`, `exec`, `window-change` | forwarding, agents, subsystems (SFTP), X11 |
 
-**[choice]** One of each. OpenSSH has offered all four since 6.5 (2014), and a second algorithm is a second thing
-to get wrong. A client that shares none is refused with `ssh-no-common-algorithm`; paramiko 5.1 is one (it has no
-ChaCha20 cipher), and the interoperation test checks that it is refused that way **[measured]**. A MAC name
-(`hmac-sha2-256`) is in KEXINIT and is never used: the one cipher carries its own tag.
+**[choice]** One of each, and two ciphers. OpenSSH has offered the first of each since 6.5 (2014), and a second
+algorithm is a second thing to get wrong. A client that shares none is refused with `ssh-no-common-algorithm`. A MAC
+name (`hmac-sha2-256`) is in KEXINIT and is never used: both ciphers carry their own tag.
+
+*(Corrected: this section offered one cipher, and paramiko 5.1, which has no ChaCha20, was refused; the
+interoperation test checked that refusal. `aes256-gcm@openssh.com` was added for it, and the test now checks that
+paramiko logs in.)* **The second cipher is software only.** `std.gcm.prepare` asks the CPU for its AES instructions
+through a builtin that is refused on the bare target, as SHA-256's is. `std.gcm`'s software functions
+(`seal_in_place_software`, `open_in_place_software`) and `std.aes` ask nothing and build there **[measured]**: a
+probe calling them, built for `aarch64-none-elf`, has no undefined symbol but the heap's bounds. So the key is
+prepared in `src/cipher.cho`, into the layout those functions read, which is `std.gcm`'s own and not a promise of
+its interface: a reference vector from another implementation holds the two together (`tests/cipher_test.cho`), and
+a change of that layout fails the gate rather than a login. The client's order decides which cipher is used, each
+way separately, so OpenSSH still gets ChaCha20.
 
 **Strict key exchange** (`kex-strict-s-v00@openssh.com`) is offered and, when the client offers its half, enforced:
 the first packet must be KEXINIT, nothing but key exchange messages may arrive before NEWKEYS, and both sequence
 numbers return to 0 at NEWKEYS. This is the countermeasure to the prefix truncation attack (Terrapin,
-CVE-2023-48795), which is against exactly this cipher.
+CVE-2023-48795), which is against ChaCha20-Poly1305 as SSH uses it.
 
 **Re-keying**: a KEXINIT from the client at any time after the first exchange is answered. The server does not start
 one itself; it refuses to let a sequence number wrap instead (`ssh-sequence-exhausted`), which a client that re-keys
-on its own schedule (OpenSSH: every 1 GiB by default for this cipher) never reaches.
+on its own schedule (OpenSSH: every 1 GiB by default for ChaCha20) never reaches. AES-GCM's nonce is a counter of 64
+bits beside it, set afresh by every key exchange, and cannot repeat before the sequence number is exhausted.
 
 **The cipher on `std.chacha20`.** OpenSSH's construction is not RFC 8439's AEAD: two keys, the length encrypted
 under the second with the sequence number as nonce, the tag over the encrypted length and payload, no padding of the
@@ -148,7 +160,7 @@ anything is indexed, and `scripts/hostile.py` (section 9) is the check.
 |---|---|---|
 | `src/sha256.cho` | `ssh_sha256` | SHA-256, software, streaming, state in the caller's `[int]` |
 | `src/wire.cho` | `ssh_wire` | the refusal codes; `uint32`, `string`, name-lists, `mpint`, read and written |
-| `src/cipher.cho` | `ssh_cipher` | `chacha20-poly1305@openssh.com`: seal and open one packet in place; the generator |
+| `src/cipher.cho` | `ssh_cipher` | the two ciphers: seal and open one packet in place; the generator |
 | `src/slot.cho` | `ssh_slot` | where everything lives in `ints` and `bytes`; the queues; packets in and out |
 | `src/kex.cho` | `ssh_kex` | KEXINIT, the exchange, the exchange hash, the keys |
 | `src/auth.cho` | `ssh_auth` | the service request and `publickey` |
@@ -158,7 +170,7 @@ anything is indexed, and `scripts/hostile.py` (section 9) is the check.
 | `tests/probes/bare.cho` | | a host shaped like a kernel's; `board.c` beside it stands for the drivers when the object is run |
 | `.cancho-vcs/` | | the package as `cancho vcs publish --dir src` writes it, for a dependent to pin |
 
-2,816 lines of cancho in `src/`; no file is over 609.
+3,013 lines of cancho in `src/`; no file is over 664.
 
 ## 8. The gate
 
@@ -171,10 +183,13 @@ anything is indexed, and `scripts/hostile.py` (section 9) is the check.
 | `check` | the package type-checks with the example, and with the bare probe |
 | `bare` | the probe builds for `aarch64-none-elf`; its module calls and does not define exactly its four drivers; the object is an ELF |
 | `store` | the committed `.cancho-vcs` is what publishing `src` writes |
-| `tests` | `cancho test` over the four files of `tests/`, each with the number of tests it must pass (34 in all) |
+| `tests` | `cancho test` over the four files of `tests/`, each with the number of tests it must pass (37 in all) |
 | `interop` | `scripts/interop.py`: OpenSSH's client, asyncssh, Dropbear's client and paramiko against `examples/sshd` |
-| `hostile` | `scripts/hostile.py`: 28 connections from a client that misbehaves, each refused with the tag expected |
+| `hostile` | `scripts/hostile.py`: 33 connections from a client that misbehaves, each refused with the tag expected |
 | `run` | `scripts/bare_run.py`: the bare object, linked with `board.c`, run under `qemu-aarch64` and logged in to |
+
+`.github/workflows/gate.yml` runs all of it on every push and pull request, with the compiler built from cancho's
+seed at the revision `cancho.toml` names.
 
 `scripts/mutants.py` is not a stage: it removes one check at a time and runs the stage that must then fail.
 
@@ -182,7 +197,7 @@ anything is indexed, and `scripts/hostile.py` (section 9) is the check.
 
 On Linux x86-64 (Xeon 2.1 GHz, 4 cores, clang 18.1.3), cancho at `e9cbde8`, at the commit that adds this section.
 
-**It interoperates.** `scripts/interop.py`, 17 checks, all pass:
+**It interoperates.** `scripts/interop.py`, 19 checks, all pass:
 
 - OpenSSH 9.6p1: a command and its output; exit statuses 7 and 127; a shell without a terminal, ended by end of
   input; a shell with a terminal (echo, prompt, `exit 3`); the user name; a key that is not authorized is refused
@@ -190,16 +205,19 @@ On Linux x86-64 (Xeon 2.1 GHz, 4 cores, clang 18.1.3), cancho at `e9cbde8`, at t
   `will use strict KEX ordering`; 6,000 lines of output arrive intact across **13 re-keys** (`RekeyLimit=32K`);
   3 MiB of input pass the 1 MiB window.
 - asyncssh 2.24.1 and Dropbear 2022.83 each log in and run a command.
-- paramiko 5.1.0 is refused at the negotiation, and the server's reason is `ssh-no-common-algorithm`.
+- OpenSSH with `Ciphers=aes256-gcm@openssh.com`: a command, and the same 6,000 lines across 13 re-keys.
+- paramiko 5.1.0 logs in and runs a command, and its transport says the cipher is `aes256-gcm@openssh.com`.
 
-**It refuses.** `scripts/hostile.py`, 28 connections from `scripts/minissh.py`, a client written from the RFCs with
+**It refuses.** `scripts/hostile.py`, 33 connections from `scripts/minissh.py`, a client written from the RFCs with
 Python's `cryptography` and not from this code: a changed bit in a sealed packet and a changed tag
 (`ssh-bad-mac`); a replayed packet; a client that does not reset its sequence number; a forged signature, a
 signature over another session's identifier, a stranger's key, a changed signature byte (each a failure, and the
 honest request after them still logs in); the sixth failure (`ssh-auth-tries`); a key query, which is answered and
 is not a login; a password; channels before a login; data for a channel that is not open; forwarding, a second
 session, SFTP and an unknown message (each declined, and the session still works); a command longer than the host
-keeps; data in the middle of a re-key; three re-keys by the client with the session used between them. The server
+keeps; data in the middle of a re-key; three re-keys by the client with the session used between them. Five are
+over AES-GCM: a changed bit, a changed length (it is in the clear, and authenticated), a replayed packet, a nonce
+used twice, and a login with a shell and three re-keys. The server
 process is running after all of them.
 
 **No input reached a trap.** Besides the above, `tests/server_test.cho` feeds 4,000 connections of generated bytes
@@ -207,10 +225,11 @@ after a good identification line, half of them shaped as a packet: 3,000 or more
 traps. *(This is not a fuzzer with coverage; it is 4,000 inputs.)*
 
 **The bare target.** `cancho build tests/probes/bare.cho examples/sshd/shell.cho src/*.cho --std --target
-aarch64-none-elf --emit obj`: an ELF object of 145,714 bytes of text whose undefined symbols are
+aarch64-none-elf --emit obj`: an ELF object of 163,796 bytes of text (145,714 before AES-GCM) whose undefined symbols are
 `__cancho_heap_start`, `__cancho_heap_end` and the probe's four `board_` functions (`llvm-nm -u`). Linked with
 `tests/probes/board.c` by `aarch64-linux-gnu-gcc -static` and run under `qemu-aarch64` 8.2, OpenSSH logs in to it:
-a command, a shell with an exit status, and 3,000 lines across re-keys (`RekeyLimit=16K`). This runs the bare
+a command, a shell with an exit status, a command over AES-256-GCM, and 3,000 lines across re-keys
+(`RekeyLimit=16K`). This runs the bare
 runtime, regions out of the link's heap, `-mstrict-align` and AArch64 code generation. It is **not** a kernel, an
 MMU-off boot or a real network: those are cancho-os's.
 
@@ -251,9 +270,9 @@ thought of; a check nobody thought to remove is not covered by this.
 ## 10. What this does not do
 
 - **No client.** Only the server side is written.
-- **One cipher.** A client without `chacha20-poly1305@openssh.com` cannot connect (paramiko). `std.aes` and
-  `std.gcm` have software paths, and `aes256-gcm@openssh.com` is the algorithm to add if this matters; whether those
-  paths build for the bare target was not tried.
+- **AES-GCM is slower than it could be.** It is the bitsliced software path everywhere, also on a machine whose CPU
+  has AES instructions, because the path that would use them does not build for the bare target (section 3). Its
+  speed was not measured.
 - **No server-initiated re-key**, no passwords, no second channel, no SFTP, no forwarding, no banner, no extension
   negotiation (`ext-info`) (section 3).
 - **Not reviewed.** Nobody but its author has read this code, and it has not been run on a Raspberry Pi: the bare

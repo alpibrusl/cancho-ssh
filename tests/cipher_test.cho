@@ -81,3 +81,81 @@ fn test_draw_moves_the_key() -> [] int {
     }
     return 0;
 }
+
+// AES-256-GCM as OpenSSH uses it, made with Python's `cryptography` (`AESGCM`): key 00..1f, nonce 64..6f, the four
+// bytes of length as the additional data. It also holds `cipher.gcm_prepare` to the layout `std.gcm` reads.
+fn gcm_clear() -> [] &static [byte] {
+    return "00000030056165732d67636d20696e2063616e63686f2c2061207061636b6574206f766572206f6e6520626c6f636b0000000000";
+}
+
+fn gcm_sealed() -> [] &static [byte] {
+    return "000000304d7abb15548e35f31e0b31c8b904049e2aad2a2aea4c8313c4bac93cdbccd32de6c92fae2932f9689290133ffd42cacfbfa790dbaaf04bc37b7391d21883208f";
+}
+
+fn gcm_nonce[&n](nonce: &!n [byte]) -> [] int {
+    var i = 0;
+    while i < 12 {
+        nonce[i] = byte_of(100 + i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_gcm_seal_and_open_match_reference() -> [] int {
+    region r {
+        let key = alloc_slice[r](64, byte_of(0));
+        let ctx = alloc_slice[r](cipher.gcm_context_len(), 0);
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let buf = alloc_slice[r](68, byte_of(0));
+        key_into(key);
+        gcm_nonce(nonce);
+        cipher.gcm_prepare(key[0..32], ctx);
+        support.unhex(gcm_clear(), buf);
+        test.assert_eq(cipher.gcm_seal(ctx, nonce, buf), 0);
+        test.assert(support.hex_is(buf, gcm_sealed()));
+        test.assert_eq(cipher.gcm_open(ctx, nonce, buf), 0);
+        test.assert(support.hex_is(buf[0..52], gcm_clear()));
+    }
+    return 0;
+}
+
+// Every single-bit change is refused, the length in the clear included, and so is the next nonce.
+fn test_gcm_open_refuses_any_changed_bit() -> [] int {
+    region r {
+        let key = alloc_slice[r](64, byte_of(0));
+        let ctx = alloc_slice[r](cipher.gcm_context_len(), 0);
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let buf = alloc_slice[r](68, byte_of(0));
+        key_into(key);
+        gcm_nonce(nonce);
+        cipher.gcm_prepare(key[0..32], ctx);
+        var bit = 0;
+        while bit < 68 * 8 {
+            support.unhex(gcm_sealed(), buf);
+            buf[bit >> 3] = byte_of(int_of(buf[bit >> 3]) ^ 1 << (bit & 7));
+            test.assert_eq(cipher.gcm_open(ctx, nonce, buf), wire.bad_mac());
+            bit = bit + 1;
+        }
+        support.unhex(gcm_sealed(), buf);
+        cipher.gcm_next(nonce);
+        test.assert_eq(cipher.gcm_open(ctx, nonce, buf), wire.bad_mac());
+    }
+    return 0;
+}
+
+// The counter is the nonce's last eight bytes, big-endian, and carries; the first four never change.
+fn test_gcm_next_carries() -> [] int {
+    region r {
+        let nonce = alloc_slice[r](12, byte_of(255));
+        nonce[4] = byte_of(1);
+        cipher.gcm_next(nonce);
+        test.assert_eq(int_of(nonce[3]), 255);
+        test.assert_eq(int_of(nonce[4]), 2);
+        test.assert_eq(int_of(nonce[5]), 0);
+        test.assert_eq(int_of(nonce[11]), 0);
+        cipher.gcm_next(nonce);
+        test.assert_eq(int_of(nonce[11]), 1);
+        test.assert_eq(int_of(nonce[10]), 0);
+    }
+    return 0;
+}
