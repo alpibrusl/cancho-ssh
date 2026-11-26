@@ -226,9 +226,10 @@ reports what a server would: `net_in("")`, `conn_accept`, `conn_read`, `conn_wri
 `fs_read("")`, `heap`, `args`, and no foreign code (it is `UNBOUNDED` only in that it does not name its port in a
 literal, since the port is an argument).
 
-**A dependent can pin it.** A scratch project, `cancho add ssh <a git repository of this tree> --rev <commit> --path
-.cancho-vcs/ssh_server`: 8 files installed, and a program that imports `ssh_server` built and ran. The repository
-was a local one (`file://`).
+**A dependent can pin it.** A scratch project, `cancho add ssh https://github.com/alpibrusl/cancho-ssh --rev
+f5a9718f2638026570b15804571eeee9d7b2fc89 --path .cancho-vcs/ssh_server`: 8 files installed, and a program that
+imports `ssh_server` and calls `ssh.start` built and ran. *(Corrected: this said the repository was a local copy,
+which is what was run before the first push.)*
 
 **Cost**, `examples/sshd` on the machine above, from `/proc/<pid>/stat`: 50 logins that each run one command cost
 380 ms of the server's CPU, **7.6 ms a login** (a key pair, a shared secret, a signature and a verification). 10.6 MB
@@ -266,5 +267,3 @@ thought of; a check nobody thought to remove is not covered by this.
   padding is encrypted and its content is not observable.
 - **`examples/sshd` serves one connection at a time**, on the loopback address, and runs a shell of five commands.
   It is a test host. A server for people needs processes and terminals, which is another program.
-- **`cancho add` against the repository on GitHub was not run**: it was run against a local copy (section 9),
-  because the repository had no commit when this was written.
