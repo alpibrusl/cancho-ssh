@@ -91,6 +91,10 @@ def main():
         r = ssh(server, "echo", "gcm", options=["Ciphers=aes256-gcm@openssh.com"])
         check("OpenSSH with AES-256-GCM runs a command", r.returncode == 0 and r.stdout == b"gcm\n"
               and r.stderr.count(b"cipher: aes256-gcm@openssh.com") == 2, repr((r.returncode, r.stdout, r.stderr[-400:])))
+        # Both ciphers offered, this server's second one first: the client's order decides (RFC 4253 section 7.1).
+        r = ssh(server, "echo", "order", options=["Ciphers=aes256-gcm@openssh.com,chacha20-poly1305@openssh.com"])
+        check("a client that lists AES-GCM first gets it", r.returncode == 0 and r.stdout == b"order\n"
+              and r.stderr.count(b"cipher: aes256-gcm@openssh.com") == 2, repr((r.returncode, r.stdout, r.stderr[-400:])))
         r = ssh(server, "-T", stdin=lines, options=["RekeyLimit=32K", "Ciphers=aes256-gcm@openssh.com"], verbose="-vv", timeout=180)
         rekeys = r.stderr.count(b"SSH2_MSG_NEWKEYS sent") - 1
         check("with AES-256-GCM, output survives %d re-keys" % rekeys, r.returncode == 0 and r.stdout == expected and rekeys >= 5,

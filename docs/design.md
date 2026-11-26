@@ -189,7 +189,8 @@ anything is indexed, and `scripts/hostile.py` (section 9) is the check.
 | `run` | `scripts/bare_run.py`: the bare object, linked with `board.c`, run under `qemu-aarch64` and logged in to |
 
 `.github/workflows/gate.yml` runs all of it on every push and pull request, with the compiler built from cancho's
-seed at the revision `cancho.toml` names.
+seed at the revision `cancho.toml` names. Its first run passed every stage, `run` included, in 7 minutes 36 seconds
+on `ubuntu-24.04`, of which 2 minutes 11 were the compiler (kept for the next run).
 
 `scripts/mutants.py` is not a stage: it removes one check at a time and runs the stage that must then fail.
 
@@ -197,7 +198,7 @@ seed at the revision `cancho.toml` names.
 
 On Linux x86-64 (Xeon 2.1 GHz, 4 cores, clang 18.1.3), cancho at `e9cbde8`, at the commit that adds this section.
 
-**It interoperates.** `scripts/interop.py`, 19 checks, all pass:
+**It interoperates.** `scripts/interop.py`, 20 checks, all pass:
 
 - OpenSSH 9.6p1: a command and its output; exit statuses 7 and 127; a shell without a terminal, ended by end of
   input; a shell with a terminal (echo, prompt, `exit 3`); the user name; a key that is not authorized is refused
@@ -205,7 +206,8 @@ On Linux x86-64 (Xeon 2.1 GHz, 4 cores, clang 18.1.3), cancho at `e9cbde8`, at t
   `will use strict KEX ordering`; 6,000 lines of output arrive intact across **13 re-keys** (`RekeyLimit=32K`);
   3 MiB of input pass the 1 MiB window.
 - asyncssh 2.24.1 and Dropbear 2022.83 each log in and run a command.
-- OpenSSH with `Ciphers=aes256-gcm@openssh.com`: a command, and the same 6,000 lines across 13 re-keys.
+- OpenSSH with `Ciphers=aes256-gcm@openssh.com`: a command, and the same 6,000 lines across 13 re-keys. With both
+  ciphers listed and AES-GCM first, AES-GCM is what the client's log says was agreed.
 - paramiko 5.1.0 logs in and runs a command, and its transport says the cipher is `aes256-gcm@openssh.com`.
 
 **It refuses.** `scripts/hostile.py`, 33 connections from `scripts/minissh.py`, a client written from the RFCs with
@@ -255,17 +257,22 @@ which is what was run before the first push.)*
 in and 10.1 MB out through a shell without a terminal cost 190 ms: about **100 MB/s** of ChaCha20-Poly1305, in place.
 Not measured on a Raspberry Pi.
 
-**The tests fail when the code is wrong.** `scripts/mutants.py`, 20 mutants, each the package with one check taken
-out, and for each the stage that must then fail: **all 20 were caught.** By `hostile`, 9: the tag is not compared;
-a packet with a bad tag is decrypted anyway; any signature logs in; failed logins are not counted; a key query
-logs in; a re-key replaces the session identifier; channel data is taken during a re-key; a second session is
-opened over the first; the connection protocol is open before a login. By `interop`, 5: the signature is not over
-the session identifier; the host's refusal is not obeyed; the sequence number is not reset at NEWKEYS; the window
-is never raised; the exchange hash leaves out this server's KEXINIT. By `tests`, 6: strict key exchange does not
-look at the first packet; it lets IGNORE through; a zero shared secret is accepted; the padding of a packet is not
-checked; a packet may be longer than the buffer; SHA-256 rotates by one bit too few. *(Corrected: this paragraph
-was committed first as a description, before the run had finished.)* Twenty mutants are the checks its author
-thought of; a check nobody thought to remove is not covered by this.
+**The tests fail when the code is wrong, once one was added.** `scripts/mutants.py`, 25 mutants, each the package
+with one check taken out, and for each the stage that must then fail. **24 were caught and one survived**: with
+the server's own order of ciphers deciding instead of the client's, every check passed, because no client in
+`interop` offered both ciphers with AES-GCM first. A check was added that does (`a client that lists AES-GCM first
+gets it`), and that mutant is caught now. By `hostile`, 11: the tag is not compared; a packet with a bad tag is
+decrypted anyway; any signature logs in; failed logins are not counted; a key query logs in; a re-key replaces the
+session identifier; channel data is taken during a re-key; a second session is opened over the first; the
+connection protocol is open before a login; AES-GCM's tag is not looked at; its nonce does not move after a packet
+is opened. By `interop`, 7: the signature is not over the session identifier; the host's refusal is not obeyed;
+the sequence number is not reset at NEWKEYS; the window is never raised; the exchange hash leaves out this server's
+KEXINIT; AES-GCM's nonce does not move after a packet is sealed; the cipher is the server's first. By `tests`, 7:
+strict key exchange does not look at the first packet; it lets IGNORE through; a zero shared secret is accepted;
+the padding of a packet is not checked; a packet may be longer than the buffer; AES-GCM's length is not
+authenticated; SHA-256 rotates by one bit too few. *(Corrected twice: this paragraph was first a description
+committed before the run finished, then "all 20 were caught", which was true of the 20 there were.)* The mutants
+are the checks their author thought of; the survivor is what that is worth.
 
 ## 10. What this does not do
 
