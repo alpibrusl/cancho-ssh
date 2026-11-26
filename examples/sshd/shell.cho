@@ -1,0 +1,277 @@
+edition 7;
+module sshd_shell;
+
+// `sshd_shell` -- a shell small enough to read: `help`, `echo`, `whoami`, `size`, `exit`, and `#` for a line that does nothing. It is what `examples/sshd`
+// runs for a session, and it stands for what a kernel has on its serial port: it touches nothing but its two slices,
+// so it holds no capability and builds for any target.
+//
+// With a terminal the client echoes nothing and sends a carriage return for Enter, so the shell echoes, edits the
+// line (backspace, Ctrl-C, Ctrl-D) and ends its lines with CR LF. Without one, lines end with LF and nothing is
+// echoed.
+//
+// `st` is `ints_len()` words and `sb` is `bytes_len()` bytes: a line, then an output queue.
+
+pub fn ints_len() -> [] int {
+    return 4;
+}
+
+fn line_cap() -> [] int {
+    return 256;
+}
+
+fn out_cap() -> [] int {
+    return 4096;
+}
+
+pub fn bytes_len() -> [] int {
+    return line_cap() + out_cap();
+}
+
+fn s_line() -> [] int {
+    return 0;
+}
+
+fn s_out_start() -> [] int {
+    return 1;
+}
+
+fn s_out_end() -> [] int {
+    return 2;
+}
+
+// -1 while the shell runs; then its exit status.
+fn s_exit() -> [] int {
+    return 3;
+}
+
+fn out_room[&s](st: &s [int]) -> [] int {
+    return out_cap() - st[s_out_end()];
+}
+
+fn put[&s, &b, &t](st: &!s [int], sb: &!b [byte], text: &t [byte]) -> [] int {
+    var n = len(text);
+    if n > out_room(st) {
+        n = out_room(st);
+    }
+    let at = line_cap() + st[s_out_end()];
+    copy_into(sb[at..at + n], text[0..n]);
+    st[s_out_end()] = st[s_out_end()] + n;
+    return n;
+}
+
+fn put_number[&s, &b](st: &!s [int], sb: &!b [byte], value: int) -> [] int {
+    region r {
+        let digits = alloc_slice[r](20, byte_of(0));
+        var at = 20;
+        var v = value;
+        if v <= 0 {
+            v = 0;
+            at = at - 1;
+            digits[at] = byte_of('0');
+        }
+        while v > 0 {
+            at = at - 1;
+            digits[at] = byte_of('0' + v % 10);
+            v = v / 10;
+        }
+        put(st, sb, digits[at..20]);
+    }
+    return 0;
+}
+
+fn newline[&s, &b](st: &!s [int], sb: &!b [byte], terminal: bool) -> [] int {
+    if terminal {
+        return put(st, sb, "\r\n");
+    }
+    return put(st, sb, "\n");
+}
+
+fn prompt[&s, &b](st: &!s [int], sb: &!b [byte], terminal: bool) -> [] int {
+    if terminal {
+        return put(st, sb, "cancho> ");
+    }
+    return 0;
+}
+
+// Backspace, a space, backspace: what takes the last character off a terminal's line.
+fn erase[&s, &b](st: &!s [int], sb: &!b [byte]) -> [] int {
+    region r {
+        let seq = alloc_slice[r](3, byte_of(8));
+        seq[1] = byte_of(' ');
+        put(st, sb, seq);
+    }
+    return 0;
+}
+
+fn same[&x, &y](x: &x [byte], y: &y [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var ok = true;
+    var i = 0;
+    while i < len(x) {
+        if int_of(x[i]) != int_of(y[i]) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+// Runs one command line. Answers its status.
+fn run[&s, &b, &l, &u](st: &!s [int], sb: &!b [byte], line: &l [byte], user: &u [byte], terminal: bool, columns: int, rows: int) -> [] int {
+    var from = 0;
+    var to = len(line);
+    while from < to && int_of(line[from]) == ' ' {
+        from = from + 1;
+    }
+    while to > from && int_of(line[to - 1]) == ' ' {
+        to = to - 1;
+    }
+    var word = from;
+    while word < to && int_of(line[word]) != ' ' {
+        word = word + 1;
+    }
+    var rest = word;
+    while rest < to && int_of(line[rest]) == ' ' {
+        rest = rest + 1;
+    }
+    if from == to {
+        return 0;
+    }
+    if int_of(line[from]) == '#' {
+        // A comment: nothing is shown.
+        return 0;
+    }
+    if same(line[from..word], "help") {
+        put(st, sb, "help, echo <text>, whoami, size, exit [status]");
+        newline(st, sb, terminal);
+        return 0;
+    }
+    if same(line[from..word], "echo") {
+        put(st, sb, line[rest..to]);
+        newline(st, sb, terminal);
+        return 0;
+    }
+    if same(line[from..word], "whoami") {
+        put(st, sb, user);
+        newline(st, sb, terminal);
+        return 0;
+    }
+    if same(line[from..word], "size") {
+        put_number(st, sb, columns);
+        put(st, sb, "x");
+        put_number(st, sb, rows);
+        newline(st, sb, terminal);
+        return 0;
+    }
+    if same(line[from..word], "exit") {
+        var status = 0;
+        var i = rest;
+        while i < to && int_of(line[i]) >= '0' && int_of(line[i]) <= '9' && status < 256 {
+            status = status * 10 + int_of(line[i]) - '0';
+            i = i + 1;
+        }
+        st[s_exit()] = status & 255;
+        return status & 255;
+    }
+    put(st, sb, "unknown command: ");
+    put(st, sb, line[from..word]);
+    newline(st, sb, terminal);
+    return 127;
+}
+
+// A session begins: a shell (a greeting and a prompt), or one command, which is run and ends the session.
+pub fn begin[&s, &b, &c, &u](st: &!s [int], sb: &!b [byte], is_command: bool, command: &c [byte], user: &u [byte], terminal: bool, columns: int, rows: int) -> [] int {
+    st[s_line()] = 0;
+    st[s_out_start()] = 0;
+    st[s_out_end()] = 0;
+    st[s_exit()] = -1;
+    if is_command {
+        let status = run(st, sb, command, user, terminal, columns, rows);
+        st[s_exit()] = status;
+        return 0;
+    }
+    if terminal {
+        put(st, sb, "cancho-ssh demonstration shell; `help` lists the commands");
+        newline(st, sb, terminal);
+    }
+    return prompt(st, sb, terminal);
+}
+
+// What the client typed. Answers how many bytes were taken: it stops while the output queue is nearly full, and
+// when the shell has exited.
+pub fn input[&s, &b, &d, &u](st: &!s [int], sb: &!b [byte], data: &d [byte], user: &u [byte], terminal: bool, columns: int, rows: int) -> [] int {
+    var i = 0;
+    while i < len(data) && st[s_exit()] < 0 && out_room(st) >= 1024 {
+        let c = int_of(data[i]);
+        let n = st[s_line()];
+        if c == '\r' || c == '\n' {
+            if terminal {
+                put(st, sb, "\r\n");
+            }
+            st[s_line()] = 0;
+            region r {
+                let line = alloc_slice[r](line_cap(), byte_of(0));
+                copy_into(line[0..n], sb[0..n]);
+                run(st, sb, line[0..n], user, terminal, columns, rows);
+            }
+            if st[s_exit()] < 0 {
+                prompt(st, sb, terminal);
+            }
+        } else if c == 127 || c == 8 {
+            if n > 0 {
+                st[s_line()] = n - 1;
+                if terminal {
+                    erase(st, sb);
+                }
+            }
+        } else if c == 3 {
+            st[s_line()] = 0;
+            if terminal {
+                put(st, sb, "^C\r\n");
+                prompt(st, sb, terminal);
+            }
+        } else if c == 4 {
+            if n == 0 {
+                st[s_exit()] = 0;
+            }
+        } else if c >= 32 && c < 127 && n < line_cap() {
+            sb[n] = byte_of(c);
+            st[s_line()] = n + 1;
+            if terminal {
+                put(st, sb, data[i..i + 1]);
+            }
+        }
+        i = i + 1;
+    }
+    return i;
+}
+
+// The client will type no more: a shell ends, as it would at the end of its input.
+pub fn end_of_input[&s](st: &!s [int]) -> [] int {
+    if st[s_exit()] < 0 {
+        st[s_exit()] = 0;
+    }
+    return 0;
+}
+
+// What the shell has to show.
+pub fn output[&s, &b](st: &s [int], sb: &b [byte]) -> [] &b [byte] {
+    return sb[line_cap() + st[s_out_start()]..line_cap() + st[s_out_end()]];
+}
+
+// `n` bytes of the output were taken.
+pub fn wrote[&s](st: &!s [int], n: int) -> [] int {
+    st[s_out_start()] = st[s_out_start()] + n;
+    if st[s_out_start()] >= st[s_out_end()] {
+        st[s_out_start()] = 0;
+        st[s_out_end()] = 0;
+    }
+    return 0;
+}
+
+// The shell's exit status once it has exited; -1 while it runs.
+pub fn exited[&s](st: &s [int]) -> [] int {
+    return st[s_exit()];
+}

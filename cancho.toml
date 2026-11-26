@@ -1,0 +1,29 @@
+[package]
+name = "ssh"
+cancho = "e9cbde8658ec1ccfad098c4b8afcf9f1c5c04c65"
+
+[[bin]]
+name = "sshd"
+sources = ["examples/sshd", "src"]
+std = true
+out = "build/sshd"
+
+[[test]]
+name = "sha256"
+sources = ["tests/sha256_test.cho", "tests/support.cho", "src"]
+std = true
+
+[[test]]
+name = "wire"
+sources = ["tests/wire_test.cho", "src"]
+std = true
+
+[[test]]
+name = "cipher"
+sources = ["tests/cipher_test.cho", "tests/support.cho", "src"]
+std = true
+
+[[test]]
+name = "server"
+sources = ["tests/server_test.cho", "src"]
+std = true

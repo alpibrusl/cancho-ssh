@@ -1,0 +1,122 @@
+edition 7;
+module ssh_cipher;
+import std.chacha20;
+import ssh_wire as wire;
+
+// `ssh_cipher` -- `chacha20-poly1305@openssh.com` (OpenSSH's PROTOCOL.chacha20poly1305), one packet at a time and in
+// place, and the generator the package draws its random bytes from (`docs/design.md` sections 2 and 3).
+//
+// A key is 64 bytes: the first 32 encrypt the packet (K_2), the last 32 encrypt its length (K_1). The nonce is the
+// packet's sequence number. This is the original ChaCha, 64 bits of counter and 64 of nonce, written on
+// `std.chacha20`'s RFC 8439 layout (32 and 96): the four bytes in front of the sequence number are the high half of
+// a counter that never reaches them.
+//
+// The keys are secret. Nothing here branches on them or on a packet's plaintext; the tag is compared without
+// stopping at the first difference.
+
+pub fn key_len() -> [] int {
+    return 64;
+}
+
+pub fn tag_len() -> [] int {
+    return 16;
+}
+
+fn nonce_into[&n](nonce: &!n [byte], seq: int) -> [] int {
+    wire.put_u32(nonce, 0, 0);
+    wire.put_u32(nonce, 4, 0);
+    return wire.put_u32(nonce, 8, seq);
+}
+
+// The packet length that the four bytes `first` hide, under `key` and sequence number `seq`. Not authenticated: the
+// caller bounds it before it waits for that many bytes, and `open` then checks the tag over those four bytes too.
+pub fn open_length[&k, &f](key: &k [byte], seq: int, first: &f [byte]) -> [] int {
+    var n = 0;
+    region r {
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let plain = alloc_slice[r](4, byte_of(0));
+        nonce_into(nonce, seq);
+        chacha20.xor(key[32..64], 0, nonce, first[0..4], plain);
+        n = wire.u32_at(plain, 0);
+        plain[0] = byte_of(0);
+        plain[1] = byte_of(0);
+        plain[2] = byte_of(0);
+        plain[3] = byte_of(0);
+    }
+    return n;
+}
+
+// Seals the packet in `buf`: four bytes of length and the `len(buf) - 20` bytes it counts, in the clear, then 16
+// bytes of room. After it `buf` is what goes on the wire.
+pub fn seal[&k, &b](key: &k [byte], seq: int, buf: &!b [byte]) -> [] int {
+    let body = len(buf) - 16;
+    region r {
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let poly = alloc_slice[r](64, byte_of(0));
+        nonce_into(nonce, seq);
+        chacha20.block(key[0..32], 0, nonce, poly);
+        chacha20.xor(key[32..64], 0, nonce, buf[0..4], buf[0..4]);
+        chacha20.xor(key[0..32], 1, nonce, buf[4..body], buf[4..body]);
+        chacha20.poly1305(poly[0..32], buf[0..body], buf[body..body + 16]);
+        var i = 0;
+        while i < 64 {
+            poly[i] = byte_of(0);
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// Opens the packet in `buf`: four bytes of encrypted length, the encrypted bytes it counts, and the 16-byte tag.
+// 0 and the bytes after the length are in the clear, or `bad_mac` and nothing was decrypted. The length itself is
+// left as it came: `open_length` is how it is read.
+pub fn open[&k, &b](key: &k [byte], seq: int, buf: &!b [byte]) -> [] int {
+    let body = len(buf) - 16;
+    var diff = 0;
+    region r {
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let poly = alloc_slice[r](64, byte_of(0));
+        let tag = alloc_slice[r](16, byte_of(0));
+        nonce_into(nonce, seq);
+        chacha20.block(key[0..32], 0, nonce, poly);
+        chacha20.poly1305(poly[0..32], buf[0..body], tag);
+        var i = 0;
+        while i < 16 {
+            diff = diff | int_of(tag[i]) ^ int_of(buf[body + i]);
+            i = i + 1;
+        }
+        if diff == 0 {
+            chacha20.xor(key[0..32], 1, nonce, buf[4..body], buf[4..body]);
+        }
+        i = 0;
+        while i < 64 {
+            poly[i] = byte_of(0);
+            i = i + 1;
+        }
+    }
+    if diff != 0 {
+        return wire.bad_mac();
+    }
+    return 0;
+}
+
+// ---- The generator ----
+
+// `len(out)` bytes (at most 32) from the generator whose 32-byte key is `key`, and a new key in its place: one
+// ChaCha20 block, the first half of which is the next key and the second half the output (fast key erasure). What was
+// drawn cannot be computed from the key that is left.
+pub fn draw[&k, &o](key: &!k [byte], out: &!o [byte]) -> [] int {
+    region r {
+        let nonce = alloc_slice[r](12, byte_of(0));
+        let block = alloc_slice[r](64, byte_of(0));
+        chacha20.block(key[0..32], 0, nonce, block);
+        copy_into(key[0..32], block[0..32]);
+        copy_into(out, block[32..32 + len(out)]);
+        var i = 0;
+        while i < 64 {
+            block[i] = byte_of(0);
+            i = i + 1;
+        }
+    }
+    return 0;
+}

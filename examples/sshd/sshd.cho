@@ -1,0 +1,361 @@
+edition 9;
+
+// `sshd` -- an SSH server on Linux and macOS, over `ssh_server`: the host that `docs/design.md` section 2 describes,
+// with a socket, a clock and two files where a kernel has a network stack, a timer and a table.
+//
+//     sshd <port> <host-key-file> <authorized-keys-file>
+//
+// It listens on 127.0.0.1 only, serves one connection at a time, and runs `sshd_shell` for a session: this is a
+// demonstration and the thing the interoperation tests log in to, not a way to reach a machine.
+//
+// `<host-key-file>` is the 32 bytes of an Ed25519 seed (`head -c 32 /dev/urandom > host_key`). Its public key is
+// printed at the start as OpenSSH writes one, for a `known_hosts` file. `<authorized-keys-file>` is OpenSSH's
+// `authorized_keys`: every `ssh-ed25519` line in it may log in, as any user name. Each connection's 32 bytes of
+// entropy come from `/dev/urandom`.
+//
+// A client that does not log in within 30 seconds, or sends nothing for 10 minutes, is disconnected. Exit status:
+// 2 a usage error, 3 the port cannot be listened on, 5 a file cannot be read.
+
+import std.bytes;
+import std.ed25519;
+import std.io;
+import ssh_server as ssh;
+import sshd_keys as keys;
+import sshd_shell as shell;
+
+fn port_of[&a](text: &a [byte]) -> [] int {
+    var value = 0;
+    var i = 0;
+    while i < len(text) && value < 65536 {
+        let digit = bytes.digit_of(int_of(text[i]));
+        if digit < 0 {
+            return -1;
+        }
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    if value > 65535 || len(text) == 0 {
+        return -1;
+    }
+    return value;
+}
+
+// Standard output is buffered: a line is written when it is said, so what watches this program sees it.
+fn flush[&i](io: &!i Io) -> [io_write] int {
+    match flush_out(io) {
+        Done::Ok(n) => {
+            return 0;
+        }
+        Done::Failed(e) => {
+            return e;
+        }
+    }
+}
+
+fn login_ms() -> [] int {
+    return 30000;
+}
+
+fn idle_ms() -> [] int {
+    return 600000;
+}
+
+fn inq_cap() -> [] int {
+    return 16384;
+}
+
+// One connection, from the first byte to the last: answers why it ended (`ssh.refusal_tag`), or 0 if the socket
+// ended first. `ints` and `bytes` were started (`ssh.start`); `inq` is where the socket is read into.
+fn serve[&c, &k, &n, &b, &s, &q, &l, &u](conn: &!c Conn, clock: &k Clock, ints: &!n [int], bytes: &!b [byte], st: &!s [int], sb: &!q [byte], list: &l [byte], inq: &!u [byte]) -> [conn_read, conn_write, poll, clock] int {
+    match poller_new() {
+        Polling::Failed(e) => {
+            return 0;
+        }
+        Polling::Ok(pl) => {
+            var poll = pl;
+            borrow mut poll as &!pw in {
+                poller_add_conn(pw, conn, 1, 1);
+                region r {
+                    let events = alloc_slice[r](8, 0);
+                    let began = clock_ms(clock);
+                    var active = began;
+                    var watching = 1;
+                    var going = true;
+                    // What was read from the socket and not yet taken: `inq[from..to]`.
+                    var from = 0;
+                    var to = 0;
+                    // The session the shell is running, by its number; 0 when it runs none.
+                    var running = 0;
+                    while going {
+                        var moved = false;
+                        var blocked = false;
+                        var flushing = true;
+                        while flushing {
+                            let out = ssh.pending(ints, bytes);
+                            var went = 0;
+                            if len(out) == 0 {
+                                flushing = false;
+                            } else {
+                                match conn_write(conn, out) {
+                                    Sent::Wrote(w) => {
+                                        went = w;
+                                    }
+                                    Sent::Again => {
+                                        blocked = true;
+                                        flushing = false;
+                                    }
+                                    Sent::Failed(e) => {
+                                        going = false;
+                                        flushing = false;
+                                    }
+                                }
+                            }
+                            if went > 0 {
+                                ssh.sent(ints, bytes, went);
+                                moved = true;
+                            }
+                        }
+                        if from < to {
+                            let took = ssh.feed(ints, bytes, inq[from..to]);
+                            if took > 0 {
+                                from = from + took;
+                                moved = true;
+                            }
+                        }
+                        if from == to {
+                            from = 0;
+                            to = 0;
+                        }
+                        if ssh.wants(ints) == ssh.want_auth() {
+                            ssh.auth_decide(ints, bytes, ssh.key_listed(list, ssh.auth_key(ints, bytes)));
+                            moved = true;
+                        }
+                        let kind = ssh.session(ints);
+                        if kind == ssh.session_none() {
+                            running = 0;
+                        } else if running != ssh.session_count(ints) {
+                            running = ssh.session_count(ints);
+                            shell.begin(st, sb, kind == ssh.session_command(), ssh.command(ints, bytes), ssh.user(ints, bytes), ssh.terminal(ints), ssh.terminal_columns(ints), ssh.terminal_rows(ints));
+                            moved = true;
+                        }
+                        if running != 0 {
+                            let shown = shell.output(st, sb);
+                            if len(shown) > 0 {
+                                let wrote = ssh.write(ints, bytes, shown);
+                                if wrote > 0 {
+                                    shell.wrote(st, wrote);
+                                    moved = true;
+                                }
+                            }
+                            if ssh.wants(ints) == ssh.want_data() {
+                                let typed = shell.input(st, sb, ssh.received(ints, bytes), ssh.user(ints, bytes), ssh.terminal(ints), ssh.terminal_columns(ints), ssh.terminal_rows(ints));
+                                if typed > 0 {
+                                    ssh.consume(ints, bytes, typed);
+                                    moved = true;
+                                } else if shell.exited(st) >= 0 {
+                                    // Typed after the shell exited: nobody will read it.
+                                    ssh.consume(ints, bytes, len(ssh.received(ints, bytes)));
+                                    moved = true;
+                                }
+                            } else if ssh.peer_eof(ints) {
+                                shell.end_of_input(st);
+                            }
+                            if shell.exited(st) >= 0 && len(shell.output(st, sb)) == 0 {
+                                if ssh.exit_session(ints, bytes, shell.exited(st)) == 0 {
+                                    running = 0;
+                                    moved = true;
+                                }
+                            }
+                        }
+                        if ssh.wants(ints) == ssh.want_nothing() && len(ssh.pending(ints, bytes)) == 0 {
+                            going = false;
+                        }
+                        if going && !moved {
+                            var want = 1;
+                            if blocked {
+                                want = 3;
+                            }
+                            if want != watching {
+                                poller_modify(pw, conn, 1, want);
+                                watching = want;
+                            }
+                            var now = clock_ms(clock);
+                            var left = active + idle_ms() - now;
+                            if !ssh.authenticated(ints) {
+                                left = began + login_ms() - now;
+                            }
+                            if left <= 0 {
+                                ssh.disconnect(ints, bytes);
+                            } else {
+                                let ready = poller_wait(pw, events, left);
+                                now = clock_ms(clock);
+                                if ready > 0 && from == to && ssh.wants(ints) != ssh.want_nothing() {
+                                    match conn_read(conn, inq) {
+                                        Received::Data(got) => {
+                                            to = got;
+                                            active = now;
+                                        }
+                                        Received::End => {
+                                            going = false;
+                                        }
+                                        Received::Again => {
+                                        }
+                                        Received::Failed(e) => {
+                                            going = false;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            poller_close(poll);
+            return ssh.failure(ints);
+        }
+    }
+}
+
+// Accepts connections one after another, for ever. Answers only when the listener fails.
+fn accept_all[&i, &h, &l, &k, &f, &s, &p, &a](io: &!i Io, heap: &!h Heap, listener: &!l Listener, clock: &k Clock, fs: &f Fs(""), seed: &s [byte], public: &p [byte], list: &a [byte]) -> [io_write, heap, conn_accept, conn_read, conn_write, poll, clock, fs_read("")] int {
+    let intsb = box_slice(heap, ssh.ints_len(), 0);
+    let bytesb = box_slice(heap, ssh.bytes_len(ssh.packet_max()), byte_of(0));
+    let inqb = box_slice(heap, inq_cap(), byte_of(0));
+    var number = 0;
+    var listening = true;
+    borrow mut intsb as &!iw in {
+        borrow mut bytesb as &!bw in {
+            borrow mut inqb as &!qw in {
+                region r {
+                    let entropy = alloc_slice[r](32, byte_of(0));
+                    let st = alloc_slice[r](shell.ints_len(), 0);
+                    let sb = alloc_slice[r](shell.bytes_len(), byte_of(0));
+                    while listening {
+                        match tcp_accept(listener) {
+                            Accepted::Ok(c) => {
+                                var conn = c;
+                                number = number + 1;
+                                var ended = 0;
+                                if fs_read(fs, "/dev/urandom", entropy) == 32 {
+                                    borrow mut conn as &!ch in {
+                                        conn_nonblocking(ch);
+                                        if ssh.start(contents(iw), contents(bw), seed, public, entropy) == 0 {
+                                            ended = serve(ch, clock, contents(iw), contents(bw), st, sb, list, contents(qw));
+                                        }
+                                    }
+                                }
+                                conn_close(conn);
+                                ssh.forget(contents(iw), contents(bw));
+                                bytes.zero(entropy);
+                                io.write_all(io, "connection ");
+                                io.print_int(io, number);
+                                io.write_all(io, " ended: ");
+                                if ended == 0 {
+                                    io.write_all(io, "socket closed");
+                                } else {
+                                    io.write_all(io, ssh.refusal_tag(ended));
+                                }
+                                io.newline(io);
+                                flush(io);
+                            }
+                            Accepted::Again => {
+                            }
+                            Accepted::Failed(e) => {
+                                listening = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    unbox_slice(heap, intsb);
+    unbox_slice(heap, bytesb);
+    unbox_slice(heap, inqb);
+    return 3;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock, signals, exec, tty } = split(world);
+    release(ffi);
+    release(signals);
+    release(exec);
+    release(tty);
+    var status = 0;
+    borrow mut io as &!i in {
+        borrow args as &g in {
+            if arg_count(g) != 4 {
+                io.error_all(i, "usage: sshd <port> <host-key-file> <authorized-keys-file>\n");
+                status = 2;
+            } else if port_of(arg(g, 1)) < 0 {
+                io.error_all(i, "sshd: the port is a number from 0 to 65535\n");
+                status = 2;
+            } else {
+                region r {
+                    let seed = alloc_slice[r](33, byte_of(0));
+                    let public = alloc_slice[r](32, byte_of(0));
+                    let text = alloc_slice[r](16384, byte_of(0));
+                    let list = alloc_slice[r](2048, byte_of(0));
+                    let line = alloc_slice[r](96, byte_of(0));
+                    var count = 0;
+                    borrow fs as &f in {
+                        if fs_read(f, arg(g, 2), seed) != 32 {
+                            io.error_all(i, "sshd: the host key file must hold exactly 32 bytes\n");
+                            status = 5;
+                        } else {
+                            let got = fs_read(f, arg(g, 3), text);
+                            if got < 0 {
+                                io.error_all(i, "sshd: cannot read the authorized keys file\n");
+                                status = 5;
+                            } else {
+                                count = keys.read(text[0..got], list);
+                            }
+                        }
+                    }
+                    if status == 0 {
+                        ed25519.public_key_from_seed(seed[0..32], public);
+                        io.write_all(i, "host key ");
+                        io.write_all(i, line[0..keys.line_of(public, line)]);
+                        io.newline(i);
+                        io.write_all(i, "authorized keys ");
+                        io.print_int(i, count);
+                        io.newline(i);
+                        borrow net as &n in {
+                            match tcp_listen_on(n, "127.0.0.1", port_of(arg(g, 1)), 8, 0) {
+                                Listening::Ok(l) => {
+                                    var listener = l;
+                                    io.write_all(i, "listening 127.0.0.1 port ");
+                                    io.print_int(i, port_of(arg(g, 1)));
+                                    io.newline(i);
+                                    flush(i);
+                                    borrow mut listener as &!lh in {
+                                        borrow mut heap as &!h in {
+                                            borrow clock as &k in {
+                                                borrow fs as &f in {
+                                                    status = accept_all(i, h, lh, k, f, seed[0..32], public, list[0..count * 32]);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    listener_close(listener);
+                                }
+                                Listening::Failed(e) => {
+                                    io.error_all(i, "sshd: cannot listen on the port\n");
+                                    status = 3;
+                                }
+                            }
+                        }
+                    }
+                    bytes.zero(seed);
+                }
+            }
+        }
+    }
+    release(io);
+    release(fs);
+    release(heap);
+    release(args);
+    release(net);
+    release(clock);
+    return status;
+}

@@ -1,0 +1,36 @@
+edition 7;
+module ssh_test_support;
+
+// What the tests share: bytes from hexadecimal, and bytes compared with it.
+
+fn nibble(c: int) -> [] int {
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - '0';
+}
+
+// `hex` decoded into the front of `out`; answers how many bytes.
+pub fn unhex[&h, &o](hex: &h [byte], out: &!o [byte]) -> [] int {
+    var i = 0;
+    while i * 2 < len(hex) {
+        out[i] = byte_of(nibble(int_of(hex[i * 2])) * 16 + nibble(int_of(hex[i * 2 + 1])));
+        i = i + 1;
+    }
+    return i;
+}
+
+pub fn hex_is[&d, &h](d: &d [byte], hex: &h [byte]) -> [] bool {
+    if len(hex) != len(d) * 2 {
+        return false;
+    }
+    var ok = true;
+    var i = 0;
+    while i < len(d) {
+        if int_of(d[i]) != nibble(int_of(hex[i * 2])) * 16 + nibble(int_of(hex[i * 2 + 1])) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}

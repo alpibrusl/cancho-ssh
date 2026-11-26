@@ -1,0 +1,134 @@
+edition 5;
+
+// bare.cho -- the package on a machine with no system (`docs/design.md` sections 1 and 8): a host shaped like a
+// kernel's, in which the network, the random generator and the key table are four foreign functions standing for
+// its drivers, and the state of the connection is in a region because there is no heap. `scripts/gate.sh` builds it
+// for `aarch64-none-elf` and reads what the object calls: these four, the two bounds of the heap, and nothing of a
+// libc. It reaches every function a host calls, so none of them can come to need a system unnoticed.
+//
+// It is not run: there is no board under it. `docs/cancho-os.md` is the same loop with the kernel's own names.
+import ssh_server as ssh;
+import sshd_shell as shell;
+
+extern fn board_receive[&f, &b](board: &f Ffi("board"), into: &!b [byte]) -> [ffi("board")] int;
+
+extern fn board_send[&f, &b](board: &f Ffi("board"), data: &b [byte]) -> [ffi("board")] int;
+
+extern fn board_random[&f, &b](board: &f Ffi("board"), into: &!b [byte]) -> [ffi("board")] int;
+
+extern fn board_key[&f, &b](board: &f Ffi("board"), into: &!b [byte]) -> [ffi("board")] int;
+
+// One connection. Answers why it ended.
+fn connection[&f](board: &f Ffi("board")) -> [ffi("board")] int {
+    var ended = 0;
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](ssh.bytes_len(8192), byte_of(0));
+        let st = alloc_slice[r](shell.ints_len(), 0);
+        let sb = alloc_slice[r](shell.bytes_len(), byte_of(0));
+        let inq = alloc_slice[r](2048, byte_of(0));
+        let seed = alloc_slice[r](32, byte_of(0));
+        let public = alloc_slice[r](32, byte_of(0));
+        let entropy = alloc_slice[r](32, byte_of(0));
+        let allowed = alloc_slice[r](32, byte_of(0));
+        board_key(board, seed);
+        board_key(board, public);
+        board_key(board, allowed);
+        board_random(board, entropy);
+        var running = 0;
+        var from = 0;
+        var to = 0;
+        var going = ssh.start(ints, bytes, seed, public, entropy) == 0;
+        while going {
+            // The rule of a host's loop: the network is read only when nothing else moved. A host that reads first
+            // waits for a client that is itself waiting, for the output this loop had not written yet.
+            var moved = false;
+            // What was received and not yet taken is `inq[from..to]`. `feed` takes what its buffer has room for,
+            // which may be less than it is given: the rest is kept and given again, never dropped.
+            if from < to {
+                let took = ssh.feed(ints, bytes, inq[from..to]);
+                if took > 0 {
+                    from = from + took;
+                    moved = true;
+                } else if took < 0 {
+                    from = to;
+                }
+            }
+            let out = ssh.pending(ints, bytes);
+            if len(out) > 0 {
+                ssh.sent(ints, bytes, board_send(board, out));
+                moved = true;
+            }
+            if ssh.wants(ints) == ssh.want_auth() {
+                ssh.auth_decide(ints, bytes, ssh.key_listed(allowed, ssh.auth_key(ints, bytes)));
+                moved = true;
+            }
+            if ssh.session(ints) == ssh.session_none() {
+                running = 0;
+            } else if running != ssh.session_count(ints) {
+                running = ssh.session_count(ints);
+                shell.begin(st, sb, ssh.session(ints) == ssh.session_command(), ssh.command(ints, bytes), ssh.user(ints, bytes), ssh.terminal(ints), ssh.terminal_columns(ints), ssh.terminal_rows(ints));
+                moved = true;
+            }
+            if running != 0 {
+                let wrote = ssh.write(ints, bytes, shell.output(st, sb));
+                if wrote > 0 {
+                    shell.wrote(st, wrote);
+                    moved = true;
+                }
+            }
+            if ssh.wants(ints) == ssh.want_data() {
+                var typed = len(ssh.received(ints, bytes));
+                if running != 0 && shell.exited(st) < 0 {
+                    typed = shell.input(st, sb, ssh.received(ints, bytes), ssh.user(ints, bytes), ssh.terminal(ints), ssh.terminal_columns(ints), ssh.terminal_rows(ints));
+                }
+                if typed > 0 {
+                    ssh.consume(ints, bytes, typed);
+                    moved = true;
+                }
+            } else if running != 0 && ssh.peer_eof(ints) {
+                shell.end_of_input(st);
+            }
+            if running != 0 && shell.exited(st) >= 0 && len(shell.output(st, sb)) == 0 {
+                if ssh.exit_session(ints, bytes, shell.exited(st)) == 0 {
+                    running = 0;
+                    moved = true;
+                }
+            }
+            if ssh.wants(ints) == ssh.want_nothing() {
+                if len(ssh.pending(ints, bytes)) == 0 {
+                    going = false;
+                }
+            } else if !moved && from == to {
+                from = 0;
+                to = board_receive(board, inq);
+            }
+            if !ssh.authenticated(ints) && ssh.packet_min() > ssh.packet_max() {
+                ssh.disconnect(ints, bytes);
+            }
+        }
+        ended = ssh.failure(ints);
+        if ssh.ended_cleanly(ended) || len(ssh.refusal_tag(ended)) == 0 {
+            ended = 0;
+        }
+        ssh.forget(ints, bytes);
+    }
+    return ended;
+}
+
+fn main(world: World) -> [] int {
+    let Split { io, ffi, fs, heap, args, net, clock } = split(world);
+    release(io);
+    release(fs);
+    release(heap);
+    release(args);
+    release(net);
+    release(clock);
+    let board = narrow(ffi, "board");
+    var status = 0;
+    borrow board as &b in {
+        status = connection(b);
+    }
+    release(board);
+    return status;
+}

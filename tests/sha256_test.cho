@@ -1,0 +1,69 @@
+edition 7;
+import std.test;
+import ssh_sha256 as sha;
+import ssh_test_support as support;
+
+fn test_empty() -> [] int {
+    region r {
+        let d = alloc_slice[r](32, byte_of(0));
+        sha.digest("", d);
+        test.assert(support.hex_is(d, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    }
+    return 0;
+}
+
+fn test_abc() -> [] int {
+    region r {
+        let d = alloc_slice[r](32, byte_of(0));
+        sha.digest("abc", d);
+        test.assert(support.hex_is(d, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    }
+    return 0;
+}
+
+fn test_two_blocks() -> [] int {
+    region r {
+        let d = alloc_slice[r](32, byte_of(0));
+        sha.digest("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", d);
+        test.assert(support.hex_is(d, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+    }
+    return 0;
+}
+
+// A million 'a', fed in pieces of 7 so every offset in the partial block is crossed.
+fn test_million_a_in_pieces() -> [] int {
+    region r {
+        let d = alloc_slice[r](32, byte_of(0));
+        let st = alloc_slice[r](sha.state_len(), 0);
+        let piece = alloc_slice[r](7, byte_of('a'));
+        sha.init(st);
+        var fed = 0;
+        while fed + 7 <= 1000000 {
+            sha.update(st, piece);
+            fed = fed + 7;
+        }
+        sha.update(st, piece[0..1000000 - fed]);
+        sha.final(st, d);
+        test.assert(support.hex_is(d, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"));
+    }
+    return 0;
+}
+
+// 55, 56, 63, 64 and 65 bytes: the lengths either side of where the padding takes a second block.
+fn test_padding_edges() -> [] int {
+    region r {
+        let d = alloc_slice[r](32, byte_of(0));
+        let m = alloc_slice[r](65, byte_of('x'));
+        sha.digest(m[0..55], d);
+        test.assert(support.hex_is(d, "d5e285683cd4efc02d021a5c62014694958901005d6f71e89e0989fac77e4072"));
+        sha.digest(m[0..56], d);
+        test.assert(support.hex_is(d, "04c26261370ee7541549d16dee320c723e3fd14671e66a099afe0a377c16888e"));
+        sha.digest(m[0..63], d);
+        test.assert(support.hex_is(d, "75220b47218278e656f2013bb8f0c455a25eaf01e86c64924e9d48d89776d6f2"));
+        sha.digest(m[0..64], d);
+        test.assert(support.hex_is(d, "7ce100971f64e7001e8fe5a51973ecdfe1ced42befe7ee8d5fd6219506b5393c"));
+        sha.digest(m, d);
+        test.assert(support.hex_is(d, "9537c5fdf120482f7d58d25e9ed583f52c02b4e304ea814db1633ad565aed7e9"));
+    }
+    return 0;
+}

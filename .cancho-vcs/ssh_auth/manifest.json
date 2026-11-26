@@ -1,0 +1,46 @@
+{
+  "entries": {
+    "08e4a8be1eeb39eb221440002af175577d7a3a60c8788fcfb2ae6d879c176824": {
+      "name": "on_service_request",
+      "stage_id": "910292b01e79de1b4ce5ae9d211a32220ddeea41ff6338eccff1ce8d8b3a97be",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "19de33043023837348b137aa33d4081972c1d04612585d602c05f0ac1343f2e5": {
+      "name": "key_name",
+      "stage_id": "05cd3a628327996fd56a9f620c91100f9d36a87eabbf7407e51799035eb1c118",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "22edf816e3e7e8cb87294df7830eb7085a6d57a735088e38f544ed410d756033": {
+      "name": "is_key_blob",
+      "stage_id": "7015bc2f45a5be6eed38bf13b47f1b3b6e7163591a7b01c963d5f546dba28014",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "36b8366579a48a4570abce7dc49cffb168668a09e0e507f6ae39a846b0d9e56a": {
+      "name": "failure",
+      "stage_id": "a89adf67df4cb715449ff0a1df1422c1dbdda7e964c9f6983ae9ee2f13ce49bf",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "3c9eb1b719836beffc4fb1607ee0f8aa0911d569dd6400b017f05942b7f88edf": {
+      "name": "decide",
+      "stage_id": "7fc17065e3ffc3cd895116c286eeaf699428608187c6f51ef6c91c7a6499386a",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "adc548095a1795ce51b2d7d0b31d347836396c64a962689149c7a21816badbfc": {
+      "name": "on_request",
+      "stage_id": "7aca88b3d423de69f752e978e2c0b6422f51f4bb52604640e72d13697f2c6db0",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    },
+    "bfba062ddd3e1da0068c6783245f217eeecfce88fbe125ee33f0fc1b949c4deb": {
+      "name": "tries_max",
+      "stage_id": "3bebb9be5b61d5e348b4f61400f5b1ffcd746543c965783210c3a1be3eaef204",
+      "source_hash": "943bead0977a8699bfb9c01c4cbe25f665a5390a6b4391e9f6f8b0d7b346c4ca",
+      "uses_std": true
+    }
+  }
+}

@@ -1,0 +1,380 @@
+edition 7;
+module ssh_channel;
+import ssh_slot as slot;
+import ssh_wire as wire;
+
+// `ssh_channel` -- the connection protocol (RFC 4254) for one `session` channel at a time: opening it, the requests
+// of a session (`pty-req`, `shell`, `exec`, `window-change`), data both ways under the two windows, and closing.
+// What a session runs is the host's (`docs/design.md` section 5). This server's channel number is always 0.
+
+// How much the client may send before the window is raised again. The buffers, not the window, are what holds a
+// client back (`docs/design.md` section 2): this only has to be large enough not to be in the way.
+pub fn window() -> [] int {
+    return 0x100000;
+}
+
+pub fn session_none() -> [] int {
+    return 0;
+}
+
+pub fn session_shell() -> [] int {
+    return 1;
+}
+
+pub fn session_command() -> [] int {
+    return 2;
+}
+
+// The most channel data one packet carries, either way.
+fn data_max[&i](ints: &i [int]) -> [] int {
+    return slot.cap(ints) - 64;
+}
+
+// May a channel message be sent now? Not during a key exchange (RFC 4253 section 7.1), and not after CLOSE.
+fn open_to_send[&i](ints: &i [int]) -> [] bool {
+    return ints[slot.i_phase()] == slot.phase_open() && ints[slot.i_kex()] == slot.kex_idle() && slot.has(ints, slot.f_channel_open()) && !slot.has(ints, slot.f_close_sent());
+}
+
+// Queues a message that is its number and the client's channel number, then `extra` 32-bit words (0, 1 or 2).
+fn send_numbers[&i, &b](ints: &!i [int], bytes: &!b [byte], kind: int, extra: int, a: int, c: int) -> [] int {
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](16, byte_of(0));
+        var p = wire.put_byte(m, 0, kind);
+        p = wire.put_u32(m, p, ints[slot.i_remote_id()]);
+        if extra > 0 {
+            p = wire.put_u32(m, p, a);
+        }
+        if extra > 1 {
+            p = wire.put_u32(m, p, c);
+        }
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    return sent;
+}
+
+// Raises the client's window by what the host has taken, once that is half of it.
+pub fn adjust[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let owed = ints[slot.i_window_owed()];
+    if owed < window() / 2 || !open_to_send(ints) || slot.out_free(ints) < 64 {
+        return 0;
+    }
+    let sent = send_numbers(ints, bytes, wire.msg_channel_window_adjust(), 1, owed, 0);
+    if sent < 0 {
+        return sent;
+    }
+    ints[slot.i_local_window()] = ints[slot.i_local_window()] + owed;
+    ints[slot.i_window_owed()] = 0;
+    return 0;
+}
+
+// CHANNEL_OPEN, the payload of `n` bytes at `at`.
+pub fn on_open[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    let tl = wire.string_len(bytes[at..at + n], 1);
+    if tl < 0 || 5 + tl + 12 > n {
+        return wire.decode();
+    }
+    let sender = wire.u32_at(bytes, at + 5 + tl);
+    var reason = 0;
+    if !wire.equal(bytes[at + 5..at + 5 + tl], "session") {
+        // SSH_OPEN_UNKNOWN_CHANNEL_TYPE
+        reason = 3;
+    } else if slot.has(ints, slot.f_channel_open()) {
+        // SSH_OPEN_RESOURCE_SHORTAGE
+        reason = 4;
+    }
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](24, byte_of(0));
+        var p = 0;
+        if reason != 0 {
+            p = wire.put_byte(m, 0, wire.msg_channel_open_failure());
+            p = wire.put_u32(m, p, sender);
+            p = wire.put_u32(m, p, reason);
+            p = wire.put_u32(m, p, 0);
+            p = wire.put_u32(m, p, 0);
+        } else {
+            p = wire.put_byte(m, 0, wire.msg_channel_open_confirmation());
+            p = wire.put_u32(m, p, sender);
+            p = wire.put_u32(m, p, 0);
+            p = wire.put_u32(m, p, window());
+            p = wire.put_u32(m, p, data_max(ints));
+        }
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    if sent < 0 || reason != 0 {
+        return sent;
+    }
+    slot.set_flag(ints, slot.f_channel_open());
+    slot.clear_flag(ints, slot.f_close_sent());
+    slot.clear_flag(ints, slot.f_peer_eof());
+    slot.clear_flag(ints, slot.f_terminal());
+    ints[slot.i_session()] = session_none();
+    ints[slot.i_remote_id()] = sender;
+    ints[slot.i_remote_window()] = wire.u32_at(bytes, at + 5 + tl + 4);
+    ints[slot.i_remote_max()] = wire.u32_at(bytes, at + 5 + tl + 8);
+    ints[slot.i_local_window()] = window();
+    ints[slot.i_window_owed()] = 0;
+    ints[slot.i_columns()] = 80;
+    ints[slot.i_rows()] = 24;
+    return 0;
+}
+
+// Is the message of `n` bytes at `at` for the channel that is open? Every channel message begins with its number.
+fn for_open_channel[&i, &b](ints: &i [int], bytes: &b [byte], at: int, n: int) -> [] bool {
+    if n < 5 || !slot.has(ints, slot.f_channel_open()) {
+        return false;
+    }
+    return wire.u32_at(bytes, at + 1) == 0;
+}
+
+// The size of a terminal, from the two words at `at`: kept only when it is one a screen could have.
+fn terminal_size[&i, &b](ints: &!i [int], bytes: &b [byte], at: int) -> [] int {
+    let columns = wire.u32_at(bytes, at);
+    let rows = wire.u32_at(bytes, at + 4);
+    if columns >= 1 && columns <= 4096 && rows >= 1 && rows <= 4096 {
+        ints[slot.i_columns()] = columns;
+        ints[slot.i_rows()] = rows;
+    }
+    return 0;
+}
+
+// CHANNEL_REQUEST, the payload of `n` bytes at `at`.
+pub fn on_request[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    if !for_open_channel(ints, bytes, at, n) {
+        return wire.channel_violation();
+    }
+    let tl = wire.string_len(bytes[at..at + n], 5);
+    if tl < 0 || 9 + tl + 1 > n {
+        return wire.decode();
+    }
+    let reply = int_of(bytes[at + 9 + tl]) != 0;
+    let rest = 9 + tl + 1;
+    var granted = false;
+    if wire.equal(bytes[at + 9..at + 9 + tl], "pty-req") {
+        let term = wire.string_len(bytes[at..at + n], rest);
+        if term < 0 {
+            return wire.decode();
+        }
+        let size = rest + 4 + term;
+        if size + 16 > n || wire.string_len(bytes[at..at + n], size + 16) < 0 {
+            return wire.decode();
+        }
+        terminal_size(ints, bytes, at + size);
+        slot.set_flag(ints, slot.f_terminal());
+        granted = true;
+    } else if wire.equal(bytes[at + 9..at + 9 + tl], "window-change") {
+        if rest + 16 > n {
+            return wire.decode();
+        }
+        terminal_size(ints, bytes, at + rest);
+        granted = true;
+    } else if wire.equal(bytes[at + 9..at + 9 + tl], "shell") {
+        if ints[slot.i_session()] == session_none() {
+            ints[slot.i_session()] = session_shell();
+            ints[slot.i_session_count()] = ints[slot.i_session_count()] + 1;
+            granted = true;
+        }
+    } else if wire.equal(bytes[at + 9..at + 9 + tl], "exec") {
+        let cl = wire.string_len(bytes[at..at + n], rest);
+        if cl < 0 {
+            return wire.decode();
+        }
+        if ints[slot.i_session()] == session_none() && cl <= slot.command_cap() {
+            copy_into(bytes[slot.b_command()..slot.b_command() + cl], bytes[at + rest + 4..at + rest + 4 + cl]);
+            ints[slot.i_command_len()] = cl;
+            ints[slot.i_session()] = session_command();
+            ints[slot.i_session_count()] = ints[slot.i_session_count()] + 1;
+            granted = true;
+        }
+    }
+    if !reply || slot.has(ints, slot.f_close_sent()) {
+        return 0;
+    }
+    if granted {
+        return send_numbers(ints, bytes, wire.msg_channel_success(), 0, 0, 0);
+    }
+    return send_numbers(ints, bytes, wire.msg_channel_failure(), 0, 0, 0);
+}
+
+// CHANNEL_DATA or CHANNEL_EXTENDED_DATA, the payload of `n` bytes at `at`. 0: counted and dropped (there is no
+// session to give it to, or it is extended data, which a client has no reason to send). 1: it waits for the host.
+pub fn on_data[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int, extended: bool) -> [] int {
+    if !for_open_channel(ints, bytes, at, n) {
+        return wire.channel_violation();
+    }
+    var p = 5;
+    if extended {
+        p = 9;
+    }
+    let dl = wire.string_len(bytes[at..at + n], p);
+    if dl < 0 || p + 4 + dl != n {
+        return wire.decode();
+    }
+    // The window is raised as the host takes data, by more than a packet holds before it can run out, so an honest
+    // or a hostile client meets the buffers first and no test reaches this. It is kept so that the count below
+    // cannot go negative whatever changes around it.
+    if dl > ints[slot.i_local_window()] {
+        return wire.channel_violation();
+    }
+    ints[slot.i_local_window()] = ints[slot.i_local_window()] - dl;
+    if extended || dl == 0 || ints[slot.i_session()] == session_none() || slot.has(ints, slot.f_close_sent()) {
+        ints[slot.i_window_owed()] = ints[slot.i_window_owed()] + dl;
+        return 0;
+    }
+    ints[slot.i_data_at()] = 5 + p + 4;
+    ints[slot.i_data_len()] = dl;
+    ints[slot.i_want()] = slot.want_data();
+    return 1;
+}
+
+// The host took `n` of the bytes that wait. When none are left the packet is done with.
+pub fn consume[&i, &b](ints: &!i [int], bytes: &!b [byte], n: int) -> [] int {
+    var took = n;
+    if took > ints[slot.i_data_len()] {
+        took = ints[slot.i_data_len()];
+    }
+    if took < 0 {
+        took = 0;
+    }
+    ints[slot.i_data_at()] = ints[slot.i_data_at()] + took;
+    ints[slot.i_data_len()] = ints[slot.i_data_len()] - took;
+    ints[slot.i_window_owed()] = ints[slot.i_window_owed()] + took;
+    if ints[slot.i_data_len()] == 0 {
+        ints[slot.i_data_at()] = 0;
+        ints[slot.i_want()] = slot.want_input();
+        slot.done(ints, bytes);
+    }
+    return adjust(ints, bytes);
+}
+
+// CHANNEL_WINDOW_ADJUST.
+pub fn on_window_adjust[&i, &b](ints: &!i [int], bytes: &b [byte], at: int, n: int) -> [] int {
+    if !for_open_channel(ints, bytes, at, n) {
+        return wire.channel_violation();
+    }
+    if n != 9 {
+        return wire.decode();
+    }
+    var w = ints[slot.i_remote_window()] + wire.u32_at(bytes, at + 5);
+    if w > 0xffffffff {
+        w = 0xffffffff;
+    }
+    ints[slot.i_remote_window()] = w;
+    return 0;
+}
+
+// CHANNEL_EOF: the client will send no more data.
+pub fn on_eof[&i, &b](ints: &!i [int], bytes: &b [byte], at: int, n: int) -> [] int {
+    if !for_open_channel(ints, bytes, at, n) {
+        return wire.channel_violation();
+    }
+    slot.set_flag(ints, slot.f_peer_eof());
+    return 0;
+}
+
+// CHANNEL_CLOSE: answered with this side's, unless it went first, and the channel is gone.
+pub fn on_close[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    if !for_open_channel(ints, bytes, at, n) {
+        return wire.channel_violation();
+    }
+    var sent = 0;
+    if !slot.has(ints, slot.f_close_sent()) {
+        sent = send_numbers(ints, bytes, wire.msg_channel_close(), 0, 0, 0);
+    }
+    slot.clear_flag(ints, slot.f_channel_open());
+    slot.clear_flag(ints, slot.f_close_sent());
+    slot.clear_flag(ints, slot.f_peer_eof());
+    slot.clear_flag(ints, slot.f_terminal());
+    ints[slot.i_session()] = session_none();
+    ints[slot.i_command_len()] = 0;
+    ints[slot.i_window_owed()] = 0;
+    return sent;
+}
+
+// GLOBAL_REQUEST: none is granted, and one that wants an answer gets REQUEST_FAILURE (which is how OpenSSH's
+// keep-alive is answered).
+pub fn on_global_request[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    let tl = wire.string_len(bytes[at..at + n], 1);
+    if tl < 0 || 5 + tl + 1 > n {
+        return wire.decode();
+    }
+    if int_of(bytes[at + 5 + tl]) == 0 {
+        return 0;
+    }
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](1, byte_of(wire.msg_request_failure()));
+        sent = slot.queue_packet(ints, bytes, m);
+    }
+    return sent;
+}
+
+// As much of `data` as the client's window, its packet size and the output buffer allow, to the session's output;
+// answers how much (0: not now), or a refusal.
+pub fn write[&i, &b, &d](ints: &!i [int], bytes: &!b [byte], data: &d [byte]) -> [] int {
+    if !open_to_send(ints) || ints[slot.i_session()] == session_none() {
+        return 0;
+    }
+    var n = len(data);
+    if n > ints[slot.i_remote_window()] {
+        n = ints[slot.i_remote_window()];
+    }
+    if n > ints[slot.i_remote_max()] {
+        n = ints[slot.i_remote_max()];
+    }
+    if n > data_max(ints) {
+        n = data_max(ints);
+    }
+    if n > slot.out_free(ints) - 64 {
+        n = slot.out_free(ints) - 64;
+    }
+    if n <= 0 {
+        return 0;
+    }
+    var sent = 0;
+    region r {
+        let head = alloc_slice[r](9, byte_of(0));
+        var p = wire.put_byte(head, 0, wire.msg_channel_data());
+        p = wire.put_u32(head, p, ints[slot.i_remote_id()]);
+        p = wire.put_u32(head, p, n);
+        sent = slot.queue_packet2(ints, bytes, head, data[0..n]);
+    }
+    if sent < 0 {
+        return sent;
+    }
+    ints[slot.i_remote_window()] = ints[slot.i_remote_window()] - n;
+    return n;
+}
+
+// Ends the session: its exit status, EOF and CLOSE. 0: queued, or there is no channel to end. 1: not now (a key
+// exchange is under way, or the output buffer is full); call again after sending what waits.
+pub fn exit_session[&i, &b](ints: &!i [int], bytes: &!b [byte], status: int) -> [] int {
+    if !slot.has(ints, slot.f_channel_open()) || slot.has(ints, slot.f_close_sent()) {
+        return 0;
+    }
+    if !open_to_send(ints) || slot.out_free(ints) < 192 {
+        return 1;
+    }
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](32, byte_of(0));
+        var p = wire.put_byte(m, 0, wire.msg_channel_request());
+        p = wire.put_u32(m, p, ints[slot.i_remote_id()]);
+        p = wire.put_string(m, p, "exit-status");
+        p = wire.put_byte(m, p, 0);
+        p = wire.put_u32(m, p, status);
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    if sent == 0 {
+        sent = send_numbers(ints, bytes, wire.msg_channel_eof(), 0, 0, 0);
+    }
+    if sent == 0 {
+        sent = send_numbers(ints, bytes, wire.msg_channel_close(), 0, 0, 0);
+    }
+    if sent < 0 {
+        return sent;
+    }
+    slot.set_flag(ints, slot.f_close_sent());
+    return 0;
+}

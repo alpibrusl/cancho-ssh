@@ -1,0 +1,276 @@
+edition 7;
+module ssh_sha256;
+
+// `ssh_sha256` -- SHA-256 (FIPS 180-4), in software, with the state in the caller's `[int]`.
+//
+// This is the software path of cancho's `std.crypto`, alone. `std.crypto.sha256` asks the CPU for its SHA
+// instructions first (`hw_sha256`), and that question is refused on the bare target (`docs/design.md` section 1), so
+// a kernel cannot call it. This file calls no builtin that needs a system. Nothing here is secret-dependent: there is
+// no branch or index on the data.
+//
+// A state is `state_len()` words:
+//
+//     0..8     the eight running words, each in [0, 0xffffffff]
+//     8..24    the partial block, as sixteen big-endian words; every byte past the waiting ones is zero
+//     24       the number of bytes hashed so far
+//     25       the number waiting in the partial block
+//     26..90   the 64-word message schedule
+
+static k256: [int] {
+    let k = alloc_slice[static](64, 0);
+    k[0] = 0x428a2f98;
+    k[1] = 0x71374491;
+    k[2] = 0xb5c0fbcf;
+    k[3] = 0xe9b5dba5;
+    k[4] = 0x3956c25b;
+    k[5] = 0x59f111f1;
+    k[6] = 0x923f82a4;
+    k[7] = 0xab1c5ed5;
+    k[8] = 0xd807aa98;
+    k[9] = 0x12835b01;
+    k[10] = 0x243185be;
+    k[11] = 0x550c7dc3;
+    k[12] = 0x72be5d74;
+    k[13] = 0x80deb1fe;
+    k[14] = 0x9bdc06a7;
+    k[15] = 0xc19bf174;
+    k[16] = 0xe49b69c1;
+    k[17] = 0xefbe4786;
+    k[18] = 0x0fc19dc6;
+    k[19] = 0x240ca1cc;
+    k[20] = 0x2de92c6f;
+    k[21] = 0x4a7484aa;
+    k[22] = 0x5cb0a9dc;
+    k[23] = 0x76f988da;
+    k[24] = 0x983e5152;
+    k[25] = 0xa831c66d;
+    k[26] = 0xb00327c8;
+    k[27] = 0xbf597fc7;
+    k[28] = 0xc6e00bf3;
+    k[29] = 0xd5a79147;
+    k[30] = 0x06ca6351;
+    k[31] = 0x14292967;
+    k[32] = 0x27b70a85;
+    k[33] = 0x2e1b2138;
+    k[34] = 0x4d2c6dfc;
+    k[35] = 0x53380d13;
+    k[36] = 0x650a7354;
+    k[37] = 0x766a0abb;
+    k[38] = 0x81c2c92e;
+    k[39] = 0x92722c85;
+    k[40] = 0xa2bfe8a1;
+    k[41] = 0xa81a664b;
+    k[42] = 0xc24b8b70;
+    k[43] = 0xc76c51a3;
+    k[44] = 0xd192e819;
+    k[45] = 0xd6990624;
+    k[46] = 0xf40e3585;
+    k[47] = 0x106aa070;
+    k[48] = 0x19a4c116;
+    k[49] = 0x1e376c08;
+    k[50] = 0x2748774c;
+    k[51] = 0x34b0bcb5;
+    k[52] = 0x391c0cb3;
+    k[53] = 0x4ed8aa4a;
+    k[54] = 0x5b9cca4f;
+    k[55] = 0x682e6ff3;
+    k[56] = 0x748f82ee;
+    k[57] = 0x78a5636f;
+    k[58] = 0x84c87814;
+    k[59] = 0x8cc70208;
+    k[60] = 0x90befffa;
+    k[61] = 0xa4506ceb;
+    k[62] = 0xbef9a3f7;
+    k[63] = 0xc67178f2;
+    return k;
+}
+
+pub fn state_len() -> [] int {
+    return 90;
+}
+
+fn mask32(x: int) -> [] int {
+    return x & 0xffffffff;
+}
+
+fn rotr32(x: int, n: int) -> [] int {
+    return mask32(x >> n | x << 32 - n);
+}
+
+// The block in `state[8..24]`, folded into the running words; then cleared, which is also what keeps the bytes past
+// the waiting ones zero. The additions are `wrapping_add` under the mask: none can overflow 64 bits, and a checked
+// one would be an overflow test on words that may be key material.
+fn compress[&st](state: &!st [int]) -> [] int {
+    var t = 0;
+    while t < 16 {
+        state[26 + t] = state[8 + t];
+        state[8 + t] = 0;
+        t = t + 1;
+    }
+    while t < 64 {
+        let w15 = state[26 + t - 15];
+        let w2 = state[26 + t - 2];
+        let s0 = rotr32(w15, 7) ^ rotr32(w15, 18) ^ w15 >> 3;
+        let s1 = rotr32(w2, 17) ^ rotr32(w2, 19) ^ w2 >> 10;
+        state[26 + t] = mask32(wrapping_add(wrapping_add(state[26 + t - 16], s0), wrapping_add(state[26 + t - 7], s1)));
+        t = t + 1;
+    }
+    var wa = state[0];
+    var wb = state[1];
+    var wc = state[2];
+    var wd = state[3];
+    var we = state[4];
+    var wf = state[5];
+    var wg = state[6];
+    var wh = state[7];
+    t = 0;
+    while t < 64 {
+        let s1 = rotr32(we, 6) ^ rotr32(we, 11) ^ rotr32(we, 25);
+        let ch = we & wf ^ (we ^ 0xffffffff) & wg;
+        let temp1 = mask32(wrapping_add(wrapping_add(wrapping_add(wh, s1), wrapping_add(ch, k256[t])), state[26 + t]));
+        let s0 = rotr32(wa, 2) ^ rotr32(wa, 13) ^ rotr32(wa, 22);
+        let maj = wa & wb ^ wa & wc ^ wb & wc;
+        let temp2 = mask32(wrapping_add(s0, maj));
+        wh = wg;
+        wg = wf;
+        wf = we;
+        we = mask32(wrapping_add(wd, temp1));
+        wd = wc;
+        wc = wb;
+        wb = wa;
+        wa = mask32(wrapping_add(temp1, temp2));
+        t = t + 1;
+    }
+    state[0] = mask32(wrapping_add(state[0], wa));
+    state[1] = mask32(wrapping_add(state[1], wb));
+    state[2] = mask32(wrapping_add(state[2], wc));
+    state[3] = mask32(wrapping_add(state[3], wd));
+    state[4] = mask32(wrapping_add(state[4], we));
+    state[5] = mask32(wrapping_add(state[5], wf));
+    state[6] = mask32(wrapping_add(state[6], wg));
+    state[7] = mask32(wrapping_add(state[7], wh));
+    return 0;
+}
+
+// A fresh state. `state` must be at least `state_len()` words.
+pub fn init[&st](state: &!st [int]) -> [] int {
+    var t = 0;
+    while t < state_len() {
+        state[t] = 0;
+        t = t + 1;
+    }
+    state[0] = 0x6a09e667;
+    state[1] = 0xbb67ae85;
+    state[2] = 0x3c6ef372;
+    state[3] = 0xa54ff53a;
+    state[4] = 0x510e527f;
+    state[5] = 0x9b05688c;
+    state[6] = 0x1f83d9ab;
+    state[7] = 0x5be0cd19;
+    return 0;
+}
+
+// One byte into the partial block; the block is compressed when it fills.
+pub fn update_byte[&st](state: &!st [int], b: int) -> [] int {
+    let have = state[25];
+    let w = 8 + (have >> 2);
+    state[w] = state[w] | (b & 255) << 24 - ((have & 3) << 3);
+    state[24] = state[24] + 1;
+    if have == 63 {
+        compress(state);
+        state[25] = 0;
+    } else {
+        state[25] = have + 1;
+    }
+    return 0;
+}
+
+// Feeds `data`.
+pub fn update[&st, &d](state: &!st [int], data: &d [byte]) -> [] int {
+    let n = len(data);
+    var at = 0;
+    while at < n && state[25] != 0 {
+        update_byte(state, int_of(data[at]));
+        at = at + 1;
+    }
+    while n - at >= 64 {
+        var t = 0;
+        while t < 16 {
+            let i = at + t * 4;
+            state[8 + t] = int_of(data[i]) << 24 | int_of(data[i + 1]) << 16 | int_of(data[i + 2]) << 8 | int_of(data[i + 3]);
+            t = t + 1;
+        }
+        compress(state);
+        state[24] = state[24] + 64;
+        at = at + 64;
+    }
+    while at < n {
+        update_byte(state, int_of(data[at]));
+        at = at + 1;
+    }
+    return 0;
+}
+
+// The 32-bit number `v`, big-endian: SSH's `uint32`, which every length in the exchange hash is.
+pub fn update_u32[&st](state: &!st [int], v: int) -> [] int {
+    update_byte(state, v >> 24);
+    update_byte(state, v >> 16);
+    update_byte(state, v >> 8);
+    return update_byte(state, v);
+}
+
+// The padding and the length, and the digest into `digest[0..32]`. The state is spent: `init` it to use it again.
+pub fn final[&st, &o](state: &!st [int], digest: &!o [byte]) -> [] int {
+    let bit_len = state[24] * 8;
+    let have = state[25];
+    let w = 8 + (have >> 2);
+    state[w] = state[w] | 0x80 << 24 - ((have & 3) << 3);
+    if have >= 56 {
+        compress(state);
+    }
+    state[22] = bit_len >> 32 & 0xffffffff;
+    state[23] = bit_len & 0xffffffff;
+    compress(state);
+    state[25] = 0;
+    var t = 0;
+    while t < 8 {
+        let word = state[t];
+        digest[t * 4] = byte_of(word >> 24 & 0xff);
+        digest[t * 4 + 1] = byte_of(word >> 16 & 0xff);
+        digest[t * 4 + 2] = byte_of(word >> 8 & 0xff);
+        digest[t * 4 + 3] = byte_of(word & 0xff);
+        t = t + 1;
+    }
+    return 0;
+}
+
+// The state `from` into `into`, so a hash can be continued two ways (the exchange hash is the prefix of every key).
+pub fn copy[&d, &s](into: &!d [int], from: &s [int]) -> [] int {
+    var t = 0;
+    while t < state_len() {
+        into[t] = from[t];
+        t = t + 1;
+    }
+    return 0;
+}
+
+// Every word cleared: a state that hashed a secret holds some of it.
+pub fn forget[&st](state: &!st [int]) -> [] int {
+    var t = 0;
+    while t < state_len() {
+        state[t] = 0;
+        t = t + 1;
+    }
+    return 0;
+}
+
+// The digest of `message`, into `digest[0..32]`.
+pub fn digest[&m, &o](message: &m [byte], out: &!o [byte]) -> [] int {
+    region r {
+        let st = alloc_slice[r](state_len(), 0);
+        init(st);
+        update(st, message);
+        final(st, out);
+    }
+    return 0;
+}

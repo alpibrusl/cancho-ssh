@@ -1,0 +1,193 @@
+edition 7;
+module ssh_auth;
+import std.ed25519;
+import ssh_slot as slot;
+import ssh_wire as wire;
+
+// `ssh_auth` -- the service request (RFC 4253 section 10) and user authentication by public key (RFC 4252 section 7,
+// RFC 8709), `ssh-ed25519` only. This module checks that the client holds the key; whether that key may log in as
+// that user is the host's answer (`docs/design.md` section 4).
+//
+// A request the host must answer stays in the input buffer, open, until `decide`: the signature is over its bytes.
+
+// How many requests may fail before the connection is refused, as OpenSSH's `MaxAuthTries`.
+pub fn tries_max() -> [] int {
+    return 6;
+}
+
+fn key_name() -> [] &static [byte] {
+    return "ssh-ed25519";
+}
+
+// USERAUTH_FAILURE, naming the one method there is. `counted` is false for the method `none`, which is how a client
+// asks what the methods are.
+fn failure[&i, &b](ints: &!i [int], bytes: &!b [byte], counted: bool) -> [] int {
+    if counted {
+        ints[slot.i_tries()] = ints[slot.i_tries()] + 1;
+        if ints[slot.i_tries()] >= tries_max() {
+            return wire.auth_tries();
+        }
+    }
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](32, byte_of(0));
+        var p = wire.put_byte(m, 0, wire.msg_userauth_failure());
+        p = wire.put_string(m, p, "publickey");
+        p = wire.put_byte(m, p, 0);
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    return sent;
+}
+
+// SERVICE_REQUEST, the payload of `n` bytes at `at`.
+pub fn on_service_request[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    if ints[slot.i_phase()] != slot.phase_service() {
+        return wire.unexpected_message();
+    }
+    let l = wire.string_len(bytes[at..at + n], 1);
+    if l < 0 || 5 + l != n {
+        return wire.decode();
+    }
+    if !wire.equal(bytes[at + 5..at + n], "ssh-userauth") {
+        return wire.unknown_service();
+    }
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](32, byte_of(0));
+        var p = wire.put_byte(m, 0, wire.msg_service_accept());
+        p = wire.put_string(m, p, "ssh-userauth");
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    if sent < 0 {
+        return sent;
+    }
+    ints[slot.i_phase()] = slot.phase_auth();
+    return 0;
+}
+
+// Is the 51 bytes at `at` the key blob of an Ed25519 key: `string "ssh-ed25519"`, `string` of 32 bytes?
+fn is_key_blob[&b](bytes: &b [byte], at: int) -> [] bool {
+    return wire.u32_at(bytes, at) == 11 && wire.equal(bytes[at + 4..at + 15], key_name()) && wire.u32_at(bytes, at + 15) == 32;
+}
+
+// USERAUTH_REQUEST, the payload of `n` bytes at `at`. 0: answered (a failure, or ignored after success). 1: it is
+// a well-formed `publickey` request with an Ed25519 key, the user and the key are kept, and the host is asked.
+pub fn on_request[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_open() {
+        // RFC 4252 section 5.3: after success, further requests are silently ignored.
+        return 0;
+    }
+    if ints[slot.i_phase()] != slot.phase_auth() {
+        return wire.unexpected_message();
+    }
+    let ul = wire.string_len(bytes[at..at + n], 1);
+    if ul < 0 {
+        return wire.decode();
+    }
+    let sv = 5 + ul;
+    let sl = wire.string_len(bytes[at..at + n], sv);
+    if sl < 0 {
+        return wire.decode();
+    }
+    let mt = sv + 4 + sl;
+    let ml = wire.string_len(bytes[at..at + n], mt);
+    if ml < 0 {
+        return wire.decode();
+    }
+    let rest = mt + 4 + ml;
+    if !wire.equal(bytes[at + mt + 4..at + rest], "publickey") {
+        return failure(ints, bytes, !wire.equal(bytes[at + mt + 4..at + rest], "none"));
+    }
+    if rest + 1 > n {
+        return wire.decode();
+    }
+    let signed = int_of(bytes[at + rest]) != 0;
+    let al = wire.string_len(bytes[at..at + n], rest + 1);
+    if al < 0 {
+        return wire.decode();
+    }
+    let kb = rest + 5 + al;
+    let kl = wire.string_len(bytes[at..at + n], kb);
+    if kl < 0 {
+        return wire.decode();
+    }
+    let sig = kb + 4 + kl;
+    if signed {
+        let gl = wire.string_len(bytes[at..at + n], sig);
+        if gl < 0 || sig + 4 + gl != n {
+            return wire.decode();
+        }
+    } else if sig != n {
+        return wire.decode();
+    }
+    var usable = ul > 0 && ul <= slot.user_cap() && wire.equal(bytes[at + sv + 4..at + mt], "ssh-connection");
+    if usable {
+        usable = kl == 51 && wire.equal(bytes[at + rest + 5..at + kb], key_name());
+    }
+    if usable {
+        usable = is_key_blob(bytes, at + kb + 4);
+    }
+    if usable && signed {
+        // A signature blob is `string "ssh-ed25519"`, `string` of 64 bytes: 83 in all.
+        usable = n - sig - 4 == 83;
+        if usable {
+            usable = wire.u32_at(bytes, at + sig + 4) == 11 && wire.equal(bytes[at + sig + 8..at + sig + 19], key_name()) && wire.u32_at(bytes, at + sig + 19) == 64;
+        }
+    }
+    if !usable {
+        return failure(ints, bytes, true);
+    }
+    copy_into(bytes[slot.b_user()..slot.b_user() + ul], bytes[at + 5..at + 5 + ul]);
+    ints[slot.i_user_len()] = ul;
+    copy_into(bytes[slot.b_auth_key()..slot.b_auth_key() + 32], bytes[at + kb + 23..at + kb + 55]);
+    ints[slot.i_auth_sig_at()] = sig;
+    slot.clear_flag(ints, slot.f_auth_signed());
+    if signed {
+        slot.set_flag(ints, slot.f_auth_signed());
+    }
+    ints[slot.i_want()] = slot.want_auth();
+    return 1;
+}
+
+// The host's answer to the request that waits. Refused by the host: a failure. Accepted without a signature (a
+// query): PK_OK, and the client will send the request again, signed. Accepted with one: the signature is checked
+// over the session identifier and the request up to it (RFC 4252 section 7), and success opens the connection.
+pub fn decide[&i, &b](ints: &!i [int], bytes: &!b [byte], accept: bool) -> [] int {
+    let at = slot.payload_at(ints);
+    let sig = ints[slot.i_auth_sig_at()];
+    var result = 0;
+    if !accept {
+        result = failure(ints, bytes, true);
+    } else if !slot.has(ints, slot.f_auth_signed()) {
+        region r {
+            let m = alloc_slice[r](80, byte_of(0));
+            var p = wire.put_byte(m, 0, wire.msg_userauth_pk_ok());
+            p = wire.put_string(m, p, key_name());
+            p = wire.put_string(m, p, bytes[at + sig - 51..at + sig]);
+            result = slot.queue_packet(ints, bytes, m[0..p]);
+        }
+    } else {
+        var good = false;
+        region r {
+            let signed = alloc_slice[r](36 + sig, byte_of(0));
+            let p = wire.put_string(signed, 0, bytes[slot.b_session_id()..slot.b_session_id() + 32]);
+            wire.put_bytes(signed, p, bytes[at..at + sig]);
+            good = ed25519.verify(bytes[slot.b_auth_key()..slot.b_auth_key() + 32], signed, bytes[at + sig + 23..at + sig + 87]) == 1;
+        }
+        if good {
+            region r {
+                let m = alloc_slice[r](1, byte_of(wire.msg_userauth_success()));
+                result = slot.queue_packet(ints, bytes, m);
+            }
+            if result == 0 {
+                ints[slot.i_phase()] = slot.phase_open();
+            }
+        } else {
+            result = failure(ints, bytes, true);
+        }
+    }
+    slot.clear_flag(ints, slot.f_auth_signed());
+    ints[slot.i_want()] = slot.want_input();
+    slot.done(ints, bytes);
+    return result;
+}

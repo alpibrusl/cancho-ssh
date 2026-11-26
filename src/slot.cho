@@ -1,0 +1,609 @@
+edition 7;
+module ssh_slot;
+import ssh_cipher as cipher;
+import ssh_wire as wire;
+
+// `ssh_slot` -- where a connection lives in the two slices the host provides, the two queues, and packets in and
+// out (RFC 4253 section 6; `docs/design.md` sections 2 and 7).
+//
+// `bytes` is a fixed part (`fixed_len()`), then the input buffer, then the output buffer, each `cap(ints)` bytes.
+// A place in the input buffer is kept relative to the first byte not yet done with, so moving what waits to the
+// front of the buffer moves nothing that is remembered.
+
+// ---- `ints` ----
+
+pub fn i_phase() -> [] int {
+    return 0;
+}
+
+pub fn i_failure() -> [] int {
+    return 1;
+}
+
+pub fn i_flags() -> [] int {
+    return 2;
+}
+
+pub fn i_cap() -> [] int {
+    return 3;
+}
+
+pub fn i_in_start() -> [] int {
+    return 4;
+}
+
+pub fn i_in_end() -> [] int {
+    return 5;
+}
+
+pub fn i_out_start() -> [] int {
+    return 6;
+}
+
+pub fn i_out_end() -> [] int {
+    return 7;
+}
+
+pub fn i_read_seq() -> [] int {
+    return 8;
+}
+
+pub fn i_write_seq() -> [] int {
+    return 9;
+}
+
+// The length of the client's identification line, without its line end.
+pub fn i_vc_len() -> [] int {
+    return 10;
+}
+
+pub fn i_tries() -> [] int {
+    return 11;
+}
+
+pub fn i_want() -> [] int {
+    return 12;
+}
+
+pub fn i_kex() -> [] int {
+    return 13;
+}
+
+// How many bytes the client may still send on the channel, and how many of those the host has taken since the
+// window was last raised.
+pub fn i_local_window() -> [] int {
+    return 14;
+}
+
+pub fn i_window_owed() -> [] int {
+    return 15;
+}
+
+pub fn i_remote_window() -> [] int {
+    return 16;
+}
+
+pub fn i_remote_max() -> [] int {
+    return 17;
+}
+
+pub fn i_remote_id() -> [] int {
+    return 18;
+}
+
+pub fn i_session() -> [] int {
+    return 19;
+}
+
+pub fn i_columns() -> [] int {
+    return 20;
+}
+
+pub fn i_rows() -> [] int {
+    return 21;
+}
+
+// The channel data that waits for the host: where it is, from the first byte of the open packet, and how long.
+pub fn i_data_at() -> [] int {
+    return 22;
+}
+
+pub fn i_data_len() -> [] int {
+    return 23;
+}
+
+pub fn i_command_len() -> [] int {
+    return 24;
+}
+
+pub fn i_user_len() -> [] int {
+    return 25;
+}
+
+// The packet length the cipher hid, once four bytes of the packet arrived; -1 before.
+pub fn i_packet_len() -> [] int {
+    return 26;
+}
+
+// The open packet: all of it on the wire, and its payload's length.
+pub fn i_packet_total() -> [] int {
+    return 27;
+}
+
+pub fn i_payload_len() -> [] int {
+    return 28;
+}
+
+// Where the signature of the authentication request that waits begins, in its payload.
+pub fn i_auth_sig_at() -> [] int {
+    return 29;
+}
+
+// The sequence number of the open packet, which UNIMPLEMENTED names.
+pub fn i_packet_seq() -> [] int {
+    return 30;
+}
+
+// How many sessions this connection has started: a host that keeps state for a session compares it.
+pub fn i_session_count() -> [] int {
+    return 31;
+}
+
+// The exchange hash in progress, `ssh_sha256.state_len()` words.
+pub fn i_sha() -> [] int {
+    return 32;
+}
+
+pub fn ints_len() -> [] int {
+    return 128;
+}
+
+// ---- Phases, the key exchange, questions, flags ----
+
+pub fn phase_ident() -> [] int {
+    return 1;
+}
+
+pub fn phase_kex() -> [] int {
+    return 2;
+}
+
+pub fn phase_service() -> [] int {
+    return 3;
+}
+
+pub fn phase_auth() -> [] int {
+    return 4;
+}
+
+pub fn phase_open() -> [] int {
+    return 5;
+}
+
+pub fn phase_ended() -> [] int {
+    return 6;
+}
+
+pub fn kex_idle() -> [] int {
+    return 0;
+}
+
+pub fn kex_wait_init() -> [] int {
+    return 1;
+}
+
+pub fn kex_wait_ecdh() -> [] int {
+    return 2;
+}
+
+pub fn kex_wait_newkeys() -> [] int {
+    return 3;
+}
+
+pub fn want_input() -> [] int {
+    return 0;
+}
+
+pub fn want_auth() -> [] int {
+    return 1;
+}
+
+pub fn want_data() -> [] int {
+    return 2;
+}
+
+pub fn want_nothing() -> [] int {
+    return 3;
+}
+
+pub fn f_read_protected() -> [] int {
+    return 1;
+}
+
+pub fn f_write_protected() -> [] int {
+    return 2;
+}
+
+pub fn f_strict() -> [] int {
+    return 4;
+}
+
+pub fn f_first_kex_done() -> [] int {
+    return 8;
+}
+
+// The client guessed the key exchange, wrongly: its next key exchange packet is not for the algorithm agreed.
+pub fn f_skip_guess() -> [] int {
+    return 16;
+}
+
+pub fn f_kexinit_sent() -> [] int {
+    return 32;
+}
+
+pub fn f_auth_signed() -> [] int {
+    return 64;
+}
+
+pub fn f_terminal() -> [] int {
+    return 128;
+}
+
+pub fn f_peer_eof() -> [] int {
+    return 256;
+}
+
+pub fn f_close_sent() -> [] int {
+    return 512;
+}
+
+pub fn f_channel_open() -> [] int {
+    return 1024;
+}
+
+pub fn has[&i](ints: &i [int], flag: int) -> [] bool {
+    return ints[i_flags()] & flag != 0;
+}
+
+pub fn set_flag[&i](ints: &!i [int], flag: int) -> [] int {
+    ints[i_flags()] = ints[i_flags()] | flag;
+    return 0;
+}
+
+pub fn clear_flag[&i](ints: &!i [int], flag: int) -> [] int {
+    if has(ints, flag) {
+        ints[i_flags()] = ints[i_flags()] - flag;
+    }
+    return 0;
+}
+
+// ---- `bytes` ----
+
+pub fn b_seed() -> [] int {
+    return 0;
+}
+
+pub fn b_host_public() -> [] int {
+    return 32;
+}
+
+pub fn b_generator() -> [] int {
+    return 64;
+}
+
+pub fn b_session_id() -> [] int {
+    return 96;
+}
+
+pub fn b_read_key() -> [] int {
+    return 128;
+}
+
+pub fn b_write_key() -> [] int {
+    return 192;
+}
+
+pub fn b_next_read() -> [] int {
+    return 256;
+}
+
+pub fn b_next_write() -> [] int {
+    return 320;
+}
+
+pub fn b_cookie() -> [] int {
+    return 384;
+}
+
+// The client's identification line, at most 255 bytes.
+pub fn b_vc() -> [] int {
+    return 400;
+}
+
+pub fn user_cap() -> [] int {
+    return 64;
+}
+
+pub fn b_user() -> [] int {
+    return 656;
+}
+
+pub fn b_auth_key() -> [] int {
+    return 720;
+}
+
+pub fn command_cap() -> [] int {
+    return 256;
+}
+
+pub fn b_command() -> [] int {
+    return 752;
+}
+
+pub fn fixed_len() -> [] int {
+    return 1024;
+}
+
+// The smallest and largest packet a host may size the buffers for. The smallest holds a client's KEXINIT, which is
+// 1.5 to 2 KiB from OpenSSH; the largest is what RFC 4253 section 6.1 says must be accepted.
+pub fn packet_min() -> [] int {
+    return 4096;
+}
+
+pub fn packet_max() -> [] int {
+    return 35000;
+}
+
+// What a packet costs on the wire beyond its payload, at most: the length, the padding and its length, the tag.
+pub fn overhead() -> [] int {
+    return 36;
+}
+
+// How long `bytes` must be for packets of at most `packet` bytes.
+pub fn bytes_len(packet: int) -> [] int {
+    return fixed_len() + 2 * (packet + overhead());
+}
+
+pub fn cap[&i](ints: &i [int]) -> [] int {
+    return ints[i_cap()];
+}
+
+pub fn b_in() -> [] int {
+    return fixed_len();
+}
+
+pub fn b_out[&i](ints: &i [int]) -> [] int {
+    return fixed_len() + cap(ints);
+}
+
+// The room every reply of the protocol fits in. No packet is opened while the output buffer has less, so a reply
+// always has somewhere to go.
+pub fn reserve() -> [] int {
+    return 1024;
+}
+
+// ---- Input ----
+
+// What waits in the input buffer.
+pub fn in_waiting[&i](ints: &i [int]) -> [] int {
+    return ints[i_in_end()] - ints[i_in_start()];
+}
+
+// Moves what waits to the front of the input buffer.
+pub fn compact_in[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let s = ints[i_in_start()];
+    let n = in_waiting(ints);
+    if s > 0 {
+        var k = 0;
+        while k < n {
+            bytes[b_in() + k] = bytes[b_in() + s + k];
+            k = k + 1;
+        }
+        ints[i_in_start()] = 0;
+        ints[i_in_end()] = n;
+    }
+    return 0;
+}
+
+// As much of `data` as fits, into the input buffer; answers how much.
+pub fn take[&i, &b, &d](ints: &!i [int], bytes: &!b [byte], data: &d [byte]) -> [] int {
+    if len(data) == 0 {
+        return 0;
+    }
+    compact_in(ints, bytes);
+    let e = ints[i_in_end()];
+    var n = cap(ints) - e;
+    if n > len(data) {
+        n = len(data);
+    }
+    if n > 0 {
+        copy_into(bytes[b_in() + e..b_in() + e + n], data[0..n]);
+        ints[i_in_end()] = e + n;
+    }
+    return n;
+}
+
+// Where the open packet's payload begins in `bytes`.
+pub fn payload_at[&i](ints: &i [int]) -> [] int {
+    return b_in() + ints[i_in_start()] + 5;
+}
+
+// The next packet, opened: its payload's length (at least 1), at `payload_at`; 0 if it has not all arrived; or a
+// refusal. `done` is what moves past it.
+pub fn next_packet[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let at = b_in() + ints[i_in_start()];
+    let have = in_waiting(ints);
+    if have < 4 {
+        return 0;
+    }
+    let protected = has(ints, f_read_protected());
+    let seq = ints[i_read_seq()];
+    var n = ints[i_packet_len()];
+    if n < 0 {
+        if protected {
+            n = cipher.open_length(bytes[b_read_key()..b_read_key() + 64], seq, bytes[at..at + 4]);
+        } else {
+            n = wire.u32_at(bytes, at);
+        }
+        ints[i_packet_len()] = n;
+    }
+    var total = 4 + n;
+    var multiple = total;
+    if protected {
+        total = 4 + n + 16;
+        multiple = n;
+    }
+    if n > cap(ints) - 20 {
+        return wire.packet_too_large();
+    }
+    if n < 8 || multiple % 8 != 0 {
+        return wire.packet_malformed();
+    }
+    if have < total {
+        return 0;
+    }
+    if protected {
+        let opened = cipher.open(bytes[b_read_key()..b_read_key() + 64], seq, bytes[at..at + total]);
+        if opened < 0 {
+            return opened;
+        }
+    }
+    let pad = int_of(bytes[at + 4]);
+    if pad < 4 || pad + 2 > n {
+        return wire.packet_malformed();
+    }
+    if seq >= 0xffffffff {
+        return wire.sequence_exhausted();
+    }
+    ints[i_packet_seq()] = seq;
+    ints[i_read_seq()] = seq + 1;
+    ints[i_packet_total()] = total;
+    ints[i_payload_len()] = n - pad - 1;
+    return n - pad - 1;
+}
+
+// Moves past the open packet, and clears it: a packet may have held a key share or what the user typed.
+pub fn done[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let at = b_in() + ints[i_in_start()];
+    let total = ints[i_packet_total()];
+    var k = 0;
+    while k < total {
+        bytes[at + k] = byte_of(0);
+        k = k + 1;
+    }
+    ints[i_in_start()] = ints[i_in_start()] + total;
+    if ints[i_in_start()] == ints[i_in_end()] {
+        ints[i_in_start()] = 0;
+        ints[i_in_end()] = 0;
+    }
+    ints[i_packet_len()] = -1;
+    ints[i_packet_total()] = 0;
+    ints[i_payload_len()] = 0;
+    return 0;
+}
+
+// ---- Output ----
+
+pub fn out_waiting[&i](ints: &i [int]) -> [] int {
+    return ints[i_out_end()] - ints[i_out_start()];
+}
+
+// The room in the output buffer, once what waits is at its front.
+pub fn out_free[&i](ints: &i [int]) -> [] int {
+    return cap(ints) - out_waiting(ints);
+}
+
+fn compact_out[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let s = ints[i_out_start()];
+    let n = out_waiting(ints);
+    let o = b_out(ints);
+    if s > 0 {
+        var k = 0;
+        while k < n {
+            bytes[o + k] = bytes[o + s + k];
+            k = k + 1;
+        }
+        ints[i_out_start()] = 0;
+        ints[i_out_end()] = n;
+    }
+    return 0;
+}
+
+// `line` as it is: the identification line, which is not a packet.
+pub fn queue_line[&i, &b, &l](ints: &!i [int], bytes: &!b [byte], line: &l [byte]) -> [] int {
+    if out_free(ints) < len(line) {
+        return wire.output_full();
+    }
+    compact_out(ints, bytes);
+    let at = b_out(ints) + ints[i_out_end()];
+    copy_into(bytes[at..at + len(line)], line);
+    ints[i_out_end()] = ints[i_out_end()] + len(line);
+    return 0;
+}
+
+// What the packet of a payload of `n` bytes is on the wire.
+pub fn packet_size[&i](ints: &i [int], n: int) -> [] int {
+    var counted = 4 + 1 + n;
+    var extra = 0;
+    if has(ints, f_write_protected()) {
+        counted = 1 + n;
+        extra = 4 + 16;
+    }
+    var pad = 8 - counted % 8;
+    if pad < 4 {
+        pad = pad + 8;
+    }
+    return counted + pad + extra;
+}
+
+// Queues one packet whose payload is `head` then `tail`, sealed when write keys are set. 0, or a refusal: no room
+// (`output_full`), or the sequence number would wrap.
+pub fn queue_packet2[&i, &b, &h, &t](ints: &!i [int], bytes: &!b [byte], head: &h [byte], tail: &t [byte]) -> [] int {
+    let n = len(head) + len(tail);
+    let total = packet_size(ints, n);
+    if out_free(ints) < total {
+        return wire.output_full();
+    }
+    let seq = ints[i_write_seq()];
+    if seq >= 0xffffffff {
+        return wire.sequence_exhausted();
+    }
+    compact_out(ints, bytes);
+    let at = b_out(ints) + ints[i_out_end()];
+    let protected = has(ints, f_write_protected());
+    var counted = total - 4;
+    if protected {
+        counted = total - 20;
+    }
+    let pad = counted - 1 - n;
+    wire.put_u32(bytes, at, counted);
+    bytes[at + 4] = byte_of(pad);
+    copy_into(bytes[at + 5..at + 5 + len(head)], head);
+    copy_into(bytes[at + 5 + len(head)..at + 5 + n], tail);
+    var k = 0;
+    while k < pad {
+        bytes[at + 5 + n + k] = byte_of(0);
+        k = k + 1;
+    }
+    if protected {
+        cipher.seal(bytes[b_write_key()..b_write_key() + 64], seq, bytes[at..at + total]);
+    }
+    ints[i_write_seq()] = seq + 1;
+    ints[i_out_end()] = ints[i_out_end()] + total;
+    return 0;
+}
+
+pub fn queue_packet[&i, &b, &p](ints: &!i [int], bytes: &!b [byte], payload: &p [byte]) -> [] int {
+    return queue_packet2(ints, bytes, payload, "");
+}
+
+// ---- Clearing ----
+
+pub fn zero[&b](bytes: &!b [byte], at: int, n: int) -> [] int {
+    var k = 0;
+    while k < n {
+        bytes[at + k] = byte_of(0);
+        k = k + 1;
+    }
+    return 0;
+}

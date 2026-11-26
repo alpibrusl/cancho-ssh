@@ -1,0 +1,516 @@
+edition 7;
+module ssh_server;
+import ssh_auth as auth;
+import ssh_channel as channel;
+import ssh_kex as kex;
+import ssh_slot as slot;
+import ssh_wire as wire;
+
+// `ssh_server` -- an SSH server for one connection, fed bytes (`docs/design.md` section 2). The host owns the
+// socket, the clock, the keys and what a session runs; this owns the protocol.
+//
+//     start(ints, bytes, seed, public, entropy)
+//     loop:
+//         send pending(ints, bytes) to the client, then sent(ints, bytes, n)
+//         wants(ints):
+//             want_input    read from the client, feed(ints, bytes, data)
+//             want_auth     auth_user, auth_key; auth_decide(ints, bytes, accept)
+//             want_data     received(ints, bytes); consume(ints, bytes, n)
+//             want_nothing  the connection is over (failure(ints) says why): close, forget(ints, bytes)
+//         session(ints) != 0: write(ints, bytes, output), and exit_session(ints, bytes, status) to end it
+//
+// Every function that answers an `int` answers a refusal (negative, `refusal_tag`) once the connection is over.
+
+pub fn ints_len() -> [] int {
+    return slot.ints_len();
+}
+
+// How long `bytes` must be for packets of at most `packet` bytes: `packet_min()` to `packet_max()`.
+pub fn bytes_len(packet: int) -> [] int {
+    return slot.bytes_len(packet);
+}
+
+pub fn packet_min() -> [] int {
+    return slot.packet_min();
+}
+
+pub fn packet_max() -> [] int {
+    return slot.packet_max();
+}
+
+pub fn want_input() -> [] int {
+    return slot.want_input();
+}
+
+pub fn want_auth() -> [] int {
+    return slot.want_auth();
+}
+
+pub fn want_data() -> [] int {
+    return slot.want_data();
+}
+
+pub fn want_nothing() -> [] int {
+    return slot.want_nothing();
+}
+
+pub fn session_none() -> [] int {
+    return channel.session_none();
+}
+
+pub fn session_shell() -> [] int {
+    return channel.session_shell();
+}
+
+pub fn session_command() -> [] int {
+    return channel.session_command();
+}
+
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    return wire.refusal_tag(code);
+}
+
+// Did the connection end the ordinary way, by the client's DISCONNECT or the host's?
+pub fn ended_cleanly(code: int) -> [] bool {
+    return code == wire.peer_disconnected() || code == wire.host_closed();
+}
+
+// ---- Ending ----
+
+// Everything secret cleared: the host key's seed, the generator, the keys, the exchange hash, and the input.
+fn wipe[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    slot.zero(bytes, slot.b_seed(), 32);
+    slot.zero(bytes, slot.b_generator(), 32);
+    slot.zero(bytes, slot.b_read_key(), 256);
+    slot.zero(bytes, slot.b_in(), slot.cap(ints));
+    var k = slot.i_sha();
+    while k < slot.ints_len() {
+        ints[k] = 0;
+        k = k + 1;
+    }
+    ints[slot.i_in_start()] = 0;
+    ints[slot.i_in_end()] = 0;
+    ints[slot.i_data_len()] = 0;
+    return 0;
+}
+
+// Ends the connection with `code`, which it answers. DISCONNECT is queued when the client can read one: after the
+// identification lines, and not in answer to its own.
+fn fail[&i, &b](ints: &!i [int], bytes: &!b [byte], code: int) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    if ints[slot.i_phase()] != slot.phase_ident() && code != wire.peer_disconnected() {
+        region r {
+            let m = alloc_slice[r](64, byte_of(0));
+            var p = wire.put_byte(m, 0, wire.msg_disconnect());
+            p = wire.put_u32(m, p, wire.disconnect_reason(code));
+            p = wire.put_string(m, p, wire.refusal_tag(code));
+            p = wire.put_u32(m, p, 0);
+            slot.queue_packet(ints, bytes, m[0..p]);
+        }
+    }
+    ints[slot.i_phase()] = slot.phase_ended();
+    ints[slot.i_failure()] = code;
+    ints[slot.i_want()] = slot.want_nothing();
+    ints[slot.i_session()] = channel.session_none();
+    wipe(ints, bytes);
+    return code;
+}
+
+// ---- The identification line (RFC 4253 section 4.2) ----
+
+// 1: the client's line is whole and kept. 0: not yet. A line that is not `SSH-2.0-`, or 255 bytes with no end, is
+// refused.
+fn ident_line[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    let at = slot.b_in() + ints[slot.i_in_start()];
+    let have = slot.in_waiting(ints);
+    var end = -1;
+    var k = 0;
+    while k < have && k < 256 && end < 0 {
+        if int_of(bytes[at + k]) == '\n' {
+            end = k;
+        }
+        k = k + 1;
+    }
+    if end < 0 {
+        if have >= 256 {
+            return wire.bad_identification();
+        }
+        return 0;
+    }
+    var n = end;
+    if n > 0 {
+        if int_of(bytes[at + n - 1]) == '\r' {
+            n = n - 1;
+        }
+    }
+    if n > 255 || n < 8 || !wire.equal(bytes[at..at + 8], "SSH-2.0-") {
+        return wire.bad_identification();
+    }
+    copy_into(bytes[slot.b_vc()..slot.b_vc() + n], bytes[at..at + n]);
+    ints[slot.i_vc_len()] = n;
+    ints[slot.i_in_start()] = ints[slot.i_in_start()] + end + 1;
+    if ints[slot.i_in_start()] == ints[slot.i_in_end()] {
+        ints[slot.i_in_start()] = 0;
+        ints[slot.i_in_end()] = 0;
+    }
+    ints[slot.i_phase()] = slot.phase_kex();
+    return 1;
+}
+
+// ---- Dispatch ----
+
+// UNIMPLEMENTED, naming the packet that was not understood (RFC 4253 section 11.4).
+fn unimplemented[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    var sent = 0;
+    region r {
+        let m = alloc_slice[r](8, byte_of(0));
+        var p = wire.put_byte(m, 0, wire.msg_unimplemented());
+        p = wire.put_u32(m, p, ints[slot.i_packet_seq()]);
+        sent = slot.queue_packet(ints, bytes, m[0..p]);
+    }
+    return sent;
+}
+
+// The open packet, whose payload is the `n` bytes at `at`. 0: done with. 1: it waits for the host. Negative: the
+// connection is refused.
+fn dispatch[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    let kind = int_of(bytes[at]);
+    let phase = ints[slot.i_phase()];
+    let in_kex = phase == slot.phase_kex() || ints[slot.i_kex()] != slot.kex_idle();
+    let strict_first = phase == slot.phase_kex() && slot.has(ints, slot.f_strict());
+    if slot.has(ints, slot.f_skip_guess()) && kind >= 30 && kind <= 49 {
+        // The packet of a wrong guess (RFC 4253 section 7): ignored, once.
+        slot.clear_flag(ints, slot.f_skip_guess());
+        return 0;
+    }
+    if kind == wire.msg_kexinit() {
+        return kex.on_kexinit(ints, bytes, at, n);
+    }
+    if kind == wire.msg_newkeys() {
+        return kex.on_newkeys(ints, bytes, n);
+    }
+    if kind == wire.msg_kex_ecdh_init() {
+        return kex.on_ecdh_init(ints, bytes, at, n);
+    }
+    if kind == wire.msg_disconnect() {
+        return wire.peer_disconnected();
+    }
+    if kind == wire.msg_ignore() || kind == wire.msg_debug() || kind == wire.msg_unimplemented() {
+        if strict_first {
+            return wire.strict_kex();
+        }
+        return 0;
+    }
+    if in_kex {
+        if strict_first {
+            return wire.strict_kex();
+        }
+        return wire.unexpected_message();
+    }
+    if kind == wire.msg_service_request() {
+        return auth.on_service_request(ints, bytes, at, n);
+    }
+    if phase == slot.phase_service() {
+        return wire.unexpected_message();
+    }
+    if kind == wire.msg_userauth_request() {
+        return auth.on_request(ints, bytes, at, n);
+    }
+    if kind >= 80 && kind <= 100 && phase != slot.phase_open() {
+        // The connection protocol, before authentication.
+        return wire.unexpected_message();
+    }
+    if phase != slot.phase_open() {
+        return unimplemented(ints, bytes);
+    }
+    if kind == wire.msg_global_request() {
+        return channel.on_global_request(ints, bytes, at, n);
+    }
+    if kind == wire.msg_channel_open() {
+        return channel.on_open(ints, bytes, at, n);
+    }
+    if kind == wire.msg_channel_window_adjust() {
+        return channel.on_window_adjust(ints, bytes, at, n);
+    }
+    if kind == wire.msg_channel_data() {
+        return channel.on_data(ints, bytes, at, n, false);
+    }
+    if kind == wire.msg_channel_extended_data() {
+        return channel.on_data(ints, bytes, at, n, true);
+    }
+    if kind == wire.msg_channel_eof() {
+        return channel.on_eof(ints, bytes, at, n);
+    }
+    if kind == wire.msg_channel_close() {
+        return channel.on_close(ints, bytes, at, n);
+    }
+    if kind == wire.msg_channel_request() {
+        return channel.on_request(ints, bytes, at, n);
+    }
+    return unimplemented(ints, bytes);
+}
+
+// Opens and answers packets until one needs the host, the input runs out, or the output buffer has no room for a
+// reply. 0, or the refusal the connection ended with.
+fn run[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    var go = true;
+    while go {
+        if ints[slot.i_phase()] == slot.phase_ended() || ints[slot.i_want()] != slot.want_input() {
+            go = false;
+        } else if slot.out_free(ints) < slot.reserve() {
+            go = false;
+        } else if ints[slot.i_phase()] == slot.phase_ident() {
+            let got = ident_line(ints, bytes);
+            if got < 0 {
+                fail(ints, bytes, got);
+            }
+            if got == 0 {
+                go = false;
+            }
+        } else {
+            let adjusted = channel.adjust(ints, bytes);
+            if adjusted < 0 {
+                fail(ints, bytes, adjusted);
+            } else {
+                let n = slot.next_packet(ints, bytes);
+                if n < 0 {
+                    fail(ints, bytes, n);
+                } else if n == 0 {
+                    go = false;
+                } else {
+                    let handled = dispatch(ints, bytes, slot.payload_at(ints), n);
+                    if handled < 0 {
+                        fail(ints, bytes, handled);
+                    } else if handled == 0 {
+                        slot.done(ints, bytes);
+                    }
+                }
+            }
+        }
+    }
+    return ints[slot.i_failure()];
+}
+
+// ---- What the host calls ----
+
+// Begins a connection in `ints` (at least `ints_len()`) and `bytes` (at least `bytes_len(packet_min())`; its
+// length decides the largest packet). `seed` is the host key's 32-byte Ed25519 seed and `public` its public key
+// (`std.ed25519.public_key_from_seed`, once); `entropy` is 32 bytes nobody else can know, different for every
+// connection. The identification line and KEXINIT are in `pending` after it.
+pub fn start[&i, &b, &s, &p, &e](ints: &!i [int], bytes: &!b [byte], seed: &s [byte], public: &p [byte], entropy: &e [byte]) -> [] int {
+    if len(ints) < slot.ints_len() || len(bytes) < slot.bytes_len(slot.packet_min()) {
+        return wire.bad_start();
+    }
+    if len(seed) != 32 || len(public) != 32 || len(entropy) != 32 {
+        return wire.bad_start();
+    }
+    var k = 0;
+    while k < slot.ints_len() {
+        ints[k] = 0;
+        k = k + 1;
+    }
+    slot.zero(bytes, 0, slot.fixed_len());
+    var cap = (len(bytes) - slot.fixed_len()) / 2;
+    if cap > slot.packet_max() + slot.overhead() {
+        cap = slot.packet_max() + slot.overhead();
+    }
+    ints[slot.i_cap()] = cap;
+    ints[slot.i_packet_len()] = -1;
+    ints[slot.i_phase()] = slot.phase_ident();
+    ints[slot.i_kex()] = slot.kex_wait_init();
+    ints[slot.i_want()] = slot.want_input();
+    copy_into(bytes[slot.b_seed()..slot.b_seed() + 32], seed);
+    copy_into(bytes[slot.b_host_public()..slot.b_host_public() + 32], public);
+    copy_into(bytes[slot.b_generator()..slot.b_generator() + 32], entropy);
+    slot.queue_line(ints, bytes, kex.identification());
+    slot.queue_line(ints, bytes, "\r\n");
+    return kex.send_kexinit(ints, bytes);
+}
+
+// Bytes from the client. Answers how many were taken, which is fewer than `len(data)` when the input buffer is
+// full (give the rest again, after answering what `wants` asks), or the refusal the connection ended with.
+pub fn feed[&i, &b, &d](ints: &!i [int], bytes: &!b [byte], data: &d [byte]) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    let took = slot.take(ints, bytes, data);
+    let ran = run(ints, bytes);
+    if ran < 0 {
+        return ran;
+    }
+    return took;
+}
+
+// What the host must do next: `want_input`, `want_auth`, `want_data` or `want_nothing`.
+pub fn wants[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_want()];
+}
+
+// Why the connection ended; 0 while it has not.
+pub fn failure[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_failure()];
+}
+
+// The bytes to send to the client. They stay until `sent` says how many went.
+pub fn pending[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] &b [byte] {
+    let o = slot.b_out(ints);
+    return bytes[o + ints[slot.i_out_start()]..o + ints[slot.i_out_end()]];
+}
+
+// `n` of the pending bytes went to the client. Packets that waited for room in the output buffer are opened now.
+pub fn sent[&i, &b](ints: &!i [int], bytes: &!b [byte], n: int) -> [] int {
+    var went = n;
+    if went > slot.out_waiting(ints) {
+        went = slot.out_waiting(ints);
+    }
+    if went < 0 {
+        went = 0;
+    }
+    ints[slot.i_out_start()] = ints[slot.i_out_start()] + went;
+    if ints[slot.i_out_start()] == ints[slot.i_out_end()] {
+        ints[slot.i_out_start()] = 0;
+        ints[slot.i_out_end()] = 0;
+    }
+    return run(ints, bytes);
+}
+
+// The user name of the request that waits (`want_auth`), and afterwards of the user who logged in.
+pub fn user[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] &b [byte] {
+    return bytes[slot.b_user()..slot.b_user() + ints[slot.i_user_len()]];
+}
+
+// The 32-byte Ed25519 public key of the request that waits.
+pub fn auth_key[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] &b [byte] {
+    return bytes[slot.b_auth_key()..slot.b_auth_key() + 32];
+}
+
+// Is `key` one of the 32-byte keys that `list` is made of, end to end?
+pub fn key_listed[&l, &k](list: &l [byte], key: &k [byte]) -> [] bool {
+    var found = false;
+    var at = 0;
+    while at + 32 <= len(list) && !found {
+        found = wire.equal(list[at..at + 32], key);
+        at = at + 32;
+    }
+    return found;
+}
+
+// The host's answer to `want_auth`: may this key log in as this user? Saying yes is not yet a login: the signature
+// is checked after it.
+pub fn auth_decide[&i, &b](ints: &!i [int], bytes: &!b [byte], accept: bool) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    if ints[slot.i_want()] != slot.want_auth() {
+        return 0;
+    }
+    let decided = auth.decide(ints, bytes, accept);
+    if decided < 0 {
+        return fail(ints, bytes, decided);
+    }
+    return run(ints, bytes);
+}
+
+// Has a user logged in?
+pub fn authenticated[&i](ints: &i [int]) -> [] bool {
+    return ints[slot.i_phase()] == slot.phase_open();
+}
+
+// What the client asked the session to be: `session_none`, `session_shell`, or `session_command` with `command`.
+pub fn session[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_session()];
+}
+
+// How many sessions the connection has started. A host that keeps state for a session starts it afresh when this
+// changes: a client may end one session and begin another between two looks.
+pub fn session_count[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_session_count()];
+}
+
+pub fn command[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] &b [byte] {
+    return bytes[slot.b_command()..slot.b_command() + ints[slot.i_command_len()]];
+}
+
+// Did the client ask for a terminal? Then it echoes nothing itself and sends a carriage return for Enter.
+pub fn terminal[&i](ints: &i [int]) -> [] bool {
+    return slot.has(ints, slot.f_terminal());
+}
+
+pub fn terminal_columns[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_columns()];
+}
+
+pub fn terminal_rows[&i](ints: &i [int]) -> [] int {
+    return ints[slot.i_rows()];
+}
+
+// Has the client said it will send no more to the session?
+pub fn peer_eof[&i](ints: &i [int]) -> [] bool {
+    return slot.has(ints, slot.f_peer_eof());
+}
+
+// The bytes the client sent to the session (`want_data`).
+pub fn received[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] &b [byte] {
+    let at = slot.b_in() + ints[slot.i_in_start()] + ints[slot.i_data_at()];
+    return bytes[at..at + ints[slot.i_data_len()]];
+}
+
+// The host took `n` of the received bytes.
+pub fn consume[&i, &b](ints: &!i [int], bytes: &!b [byte], n: int) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    if ints[slot.i_want()] != slot.want_data() {
+        return 0;
+    }
+    let taken = channel.consume(ints, bytes, n);
+    if taken < 0 {
+        return fail(ints, bytes, taken);
+    }
+    return run(ints, bytes);
+}
+
+// Output of the session, to the client. Answers how many bytes were taken: fewer than `len(data)`, or 0, when the
+// client's window, a key exchange or the output buffer is in the way. Send what is pending and give the rest again.
+pub fn write[&i, &b, &d](ints: &!i [int], bytes: &!b [byte], data: &d [byte]) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    let wrote = channel.write(ints, bytes, data);
+    if wrote < 0 {
+        return fail(ints, bytes, wrote);
+    }
+    return wrote;
+}
+
+// Ends the session with an exit status. 0: done. 1: not now; send what is pending and call again.
+pub fn exit_session[&i, &b](ints: &!i [int], bytes: &!b [byte], status: int) -> [] int {
+    if ints[slot.i_phase()] == slot.phase_ended() {
+        return ints[slot.i_failure()];
+    }
+    let ended = channel.exit_session(ints, bytes, status);
+    if ended < 0 {
+        return fail(ints, bytes, ended);
+    }
+    if ended == 0 {
+        ints[slot.i_session()] = channel.session_none();
+    }
+    return ended;
+}
+
+// Ends the connection from this side: DISCONNECT is pending after it.
+pub fn disconnect[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    return fail(ints, bytes, wire.host_closed());
+}
+
+// Clears everything: call it when the connection is closed, before the slices are used for another.
+pub fn forget[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    var k = 0;
+    while k < len(ints) {
+        ints[k] = 0;
+        k = k + 1;
+    }
+    return slot.zero(bytes, 0, len(bytes));
+}

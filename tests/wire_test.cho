@@ -1,0 +1,77 @@
+edition 7;
+import std.test;
+import ssh_wire as wire;
+
+fn test_listed() -> [] int {
+    test.assert(wire.listed("a,bc,def", "a"));
+    test.assert(wire.listed("a,bc,def", "bc"));
+    test.assert(wire.listed("a,bc,def", "def"));
+    test.assert(!wire.listed("a,bc,def", "b"));
+    test.assert(!wire.listed("a,bc,def", "de"));
+    test.assert(!wire.listed("", "a"));
+    test.assert(!wire.listed("abc", ""));
+    test.assert(wire.listed("abc", "abc"));
+    return 0;
+}
+
+fn test_first_name() -> [] int {
+    test.assert(wire.equal(wire.first_name("a,bc"), "a"));
+    test.assert(wire.equal(wire.first_name("abc"), "abc"));
+    test.assert(wire.equal(wire.first_name(""), ""));
+    return 0;
+}
+
+fn test_string_len_refuses_what_is_not_whole() -> [] int {
+    region r {
+        let b = alloc_slice[r](8, byte_of(0));
+        b[3] = byte_of(4);
+        test.assert_eq(wire.string_len(b, 0), 4);
+        b[3] = byte_of(5);
+        test.assert_eq(wire.string_len(b, 0), -1);
+        test.assert_eq(wire.string_len(b, 5), -1);
+        test.assert_eq(wire.string_len(b, 4), 0);
+        b[0] = byte_of(255);
+        test.assert_eq(wire.string_len(b, 0), -1);
+    }
+    return 0;
+}
+
+fn test_put_and_read() -> [] int {
+    region r {
+        let b = alloc_slice[r](16, byte_of(0));
+        var at = wire.put_u32(b, 0, 0x01020304);
+        at = wire.put_string(b, at, "abc");
+        at = wire.put_byte(b, at, 9);
+        test.assert_eq(at, 12);
+        test.assert_eq(wire.u32_at(b, 0), 0x01020304);
+        test.assert_eq(wire.string_len(b, 4), 3);
+        test.assert(wire.equal(b[8..11], "abc"));
+    }
+    return 0;
+}
+
+fn test_mpint_shape() -> [] int {
+    region r {
+        let v = alloc_slice[r](4, byte_of(0));
+        v[3] = byte_of(1);
+        test.assert_eq(wire.mpint_shape(v), 6);
+        v[0] = byte_of(0x80);
+        test.assert_eq(wire.mpint_shape(v), 1);
+        v[0] = byte_of(0x7f);
+        test.assert_eq(wire.mpint_shape(v), 0);
+        v[0] = byte_of(0);
+        v[1] = byte_of(0xff);
+        test.assert_eq(wire.mpint_shape(v), 3);
+    }
+    return 0;
+}
+
+fn test_every_refusal_has_a_tag() -> [] int {
+    var code = -1;
+    while code >= -18 {
+        test.assert(!wire.equal(wire.refusal_tag(code), "unknown"));
+        code = code - 1;
+    }
+    test.assert(wire.equal(wire.refusal_tag(-19), "unknown"));
+    return 0;
+}

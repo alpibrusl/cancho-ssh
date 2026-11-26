@@ -1,0 +1,136 @@
+edition 7;
+module sshd_keys;
+
+// `sshd_keys` -- the keys of `examples/sshd` as OpenSSH writes them: `ssh-ed25519 <base64> [comment]`, one a line,
+// which is the format of `authorized_keys` and of a `.pub` file. Only Ed25519 lines are read; every other line is
+// passed over.
+
+fn value_of(c: int) -> [] int {
+    if c >= 'A' && c <= 'Z' {
+        return c - 'A';
+    }
+    if c >= 'a' && c <= 'z' {
+        return c - 'a' + 26;
+    }
+    if c >= '0' && c <= '9' {
+        return c - '0' + 52;
+    }
+    if c == '+' {
+        return 62;
+    }
+    if c == '/' {
+        return 63;
+    }
+    return -1;
+}
+
+// Base64 text decoded into the front of `out`; answers how many bytes, or -1 for text that is not base64 or does
+// not fit. Padding ends it.
+fn decode[&t, &o](text: &t [byte], out: &!o [byte]) -> [] int {
+    var acc = 0;
+    var bits = 0;
+    var n = 0;
+    var i = 0;
+    var bad = false;
+    var stop = false;
+    while i < len(text) && !bad && !stop {
+        let c = int_of(text[i]);
+        if c == '=' {
+            stop = true;
+        } else {
+            let v = value_of(c);
+            if v < 0 {
+                bad = true;
+            } else {
+                acc = (acc << 6 | v) & 0xffffff;
+                bits = bits + 6;
+                if bits >= 8 {
+                    bits = bits - 8;
+                    if n >= len(out) {
+                        bad = true;
+                    } else {
+                        out[n] = byte_of(acc >> bits & 255);
+                        n = n + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if bad {
+        return -1;
+    }
+    return n;
+}
+
+fn starts[&t, &p](text: &t [byte], at: int, prefix: &p [byte]) -> [] bool {
+    if at + len(prefix) > len(text) {
+        return false;
+    }
+    var ok = true;
+    var i = 0;
+    while i < len(prefix) {
+        if int_of(text[at + i]) != int_of(prefix[i]) {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    return ok;
+}
+
+// Reads the Ed25519 keys of `text` into `list`, 32 bytes each, end to end; answers how many keys.
+pub fn read[&t, &l](text: &t [byte], list: &!l [byte]) -> [] int {
+    var count = 0;
+    var at = 0;
+    region r {
+        let blob = alloc_slice[r](64, byte_of(0));
+        while at < len(text) {
+            var end = at;
+            while end < len(text) && int_of(text[end]) != '\n' {
+                end = end + 1;
+            }
+            if starts(text, at, "ssh-ed25519 ") {
+                var stop = at + 12;
+                while stop < end && int_of(text[stop]) != ' ' && int_of(text[stop]) != '\r' {
+                    stop = stop + 1;
+                }
+                // The blob is `string "ssh-ed25519"`, `string` of 32 bytes: 51 bytes, the key the last 32.
+                if decode(text[at + 12..stop], blob) == 51 && (count + 1) * 32 <= len(list) {
+                    copy_into(list[count * 32..count * 32 + 32], blob[19..51]);
+                    count = count + 1;
+                }
+            }
+            at = end + 1;
+        }
+    }
+    return count;
+}
+
+// The line OpenSSH writes for the Ed25519 public key `key`, without a line end, into `out` (at least 80 bytes);
+// answers its length.
+pub fn line_of[&k, &o](key: &k [byte], out: &!o [byte]) -> [] int {
+    var n = 0;
+    region r {
+        let blob = alloc_slice[r](51, byte_of(0));
+        blob[3] = byte_of(11);
+        copy_into(blob[4..15], "ssh-ed25519");
+        blob[18] = byte_of(32);
+        copy_into(blob[19..51], key[0..32]);
+        copy_into(out[0..12], "ssh-ed25519 ");
+        n = 12;
+        var i = 0;
+        while i < 51 {
+            let a = int_of(blob[i]);
+            let b = int_of(blob[i + 1]);
+            let c = int_of(blob[i + 2]);
+            let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            out[n] = alphabet[a >> 2];
+            out[n + 1] = alphabet[(a & 3) << 4 | b >> 4];
+            out[n + 2] = alphabet[(b & 15) << 2 | c >> 6];
+            out[n + 3] = alphabet[c & 63];
+            n = n + 4;
+            i = i + 3;
+        }
+    }
+    return n;
+}

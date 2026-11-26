@@ -1,0 +1,500 @@
+edition 7;
+import std.ed25519;
+import std.test;
+import ssh_server as ssh;
+import ssh_wire as wire;
+
+// The server, fed by hand: what it says first, and what it refuses before any key is agreed. Everything here is in
+// the clear, so the packets are made with `packet` below. What needs a client (the exchange itself, authentication,
+// a session) is `scripts/interop.py`'s.
+
+fn bytes_len() -> [] int {
+    return ssh.bytes_len(ssh.packet_min());
+}
+
+// A fresh server in `ints` and `bytes`.
+fn begin[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    var started = 0;
+    region r {
+        let seed = alloc_slice[r](32, byte_of(7));
+        let public = alloc_slice[r](32, byte_of(0));
+        let entropy = alloc_slice[r](32, byte_of(9));
+        ed25519.public_key_from_seed(seed, public);
+        started = ssh.start(ints, bytes, seed, public, entropy);
+    }
+    return started;
+}
+
+// `payload` as a packet in the clear (RFC 4253 section 6), into `out`; answers its length.
+fn packet[&o, &p](out: &!o [byte], payload: &p [byte]) -> [] int {
+    let n = len(payload);
+    var pad = 8 - (5 + n) % 8;
+    if pad < 4 {
+        pad = pad + 8;
+    }
+    wire.put_u32(out, 0, 1 + n + pad);
+    out[4] = byte_of(pad);
+    wire.put_bytes(out, 5, payload);
+    var k = 0;
+    while k < pad {
+        out[5 + n + k] = byte_of(0);
+        k = k + 1;
+    }
+    return 5 + n + pad;
+}
+
+// A KEXINIT payload offering `kex` and, for every other list, what this server has; answers its length.
+fn kexinit[&o, &k, &h](out: &!o [byte], kex: &k [byte], host_key: &h [byte], follows: int) -> [] int {
+    var at = wire.put_byte(out, 0, 20);
+    var k = 0;
+    while k < 16 {
+        at = wire.put_byte(out, at, k);
+        k = k + 1;
+    }
+    at = wire.put_string(out, at, kex);
+    at = wire.put_string(out, at, host_key);
+    at = wire.put_string(out, at, "aes128-ctr,chacha20-poly1305@openssh.com");
+    at = wire.put_string(out, at, "chacha20-poly1305@openssh.com");
+    at = wire.put_string(out, at, "hmac-sha2-256");
+    at = wire.put_string(out, at, "hmac-sha2-256");
+    at = wire.put_string(out, at, "none,zlib");
+    at = wire.put_string(out, at, "none");
+    at = wire.put_string(out, at, "");
+    at = wire.put_string(out, at, "");
+    at = wire.put_byte(out, at, follows);
+    return wire.put_u32(out, at, 0);
+}
+
+// Feeds `payload` as one packet in the clear; answers what `feed` did.
+fn feed_packet[&i, &b, &p](ints: &!i [int], bytes: &!b [byte], payload: &p [byte]) -> [] int {
+    var fed = 0;
+    region r {
+        let wire_bytes = alloc_slice[r](len(payload) + 32, byte_of(0));
+        let n = packet(wire_bytes, payload);
+        fed = ssh.feed(ints, bytes, wire_bytes[0..n]);
+    }
+    return fed;
+}
+
+// Does what is pending end with a DISCONNECT in the clear? The last packet's payload begins with 1.
+fn ends_with_disconnect[&i, &b](ints: &i [int], bytes: &b [byte]) -> [] bool {
+    let out = ssh.pending(ints, bytes);
+    var at = 20;
+    var last = -1;
+    while at + 5 <= len(out) {
+        last = int_of(out[at + 5]);
+        at = at + 4 + wire.u32_at(out, at);
+    }
+    return last == 1 && at == len(out);
+}
+
+fn test_start_refuses_slices_that_are_too_short() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let key = alloc_slice[r](32, byte_of(1));
+        test.assert_eq(ssh.start(ints[0..ssh.ints_len() - 1], bytes, key, key, key), wire.bad_start());
+        test.assert_eq(ssh.start(ints, bytes[0..bytes_len() - 1], key, key, key), wire.bad_start());
+        test.assert_eq(ssh.start(ints, bytes, key[0..31], key, key), wire.bad_start());
+        test.assert_eq(ssh.start(ints, bytes, key, key[0..31], key), wire.bad_start());
+        test.assert_eq(ssh.start(ints, bytes, key, key, key[0..31]), wire.bad_start());
+        test.assert_eq(ssh.start(ints, bytes, key, key, key), 0);
+    }
+    return 0;
+}
+
+fn test_start_says_who_it_is_and_sends_kexinit() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        test.assert_eq(begin(ints, bytes), 0);
+        let out = ssh.pending(ints, bytes);
+        test.assert(wire.equal(out[0..20], "SSH-2.0-cancho_0.1\r\n"));
+        test.assert_eq(int_of(out[25]), 20);
+        test.assert_eq(20 + 4 + wire.u32_at(out, 20), len(out));
+        test.assert_eq(ssh.wants(ints), ssh.want_input());
+        test.assert_eq(ssh.failure(ints), 0);
+    }
+    return 0;
+}
+
+fn test_two_starts_draw_different_cookies_from_different_entropy() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let first = alloc_slice[r](16, byte_of(0));
+        let key = alloc_slice[r](32, byte_of(1));
+        let entropy = alloc_slice[r](32, byte_of(1));
+        ssh.start(ints, bytes, key, key, entropy);
+        copy_into(first, ssh.pending(ints, bytes)[26..42]);
+        entropy[0] = byte_of(2);
+        ssh.start(ints, bytes, key, key, entropy);
+        test.assert(!wire.equal(first, ssh.pending(ints, bytes)[26..42]));
+    }
+    return 0;
+}
+
+fn test_an_old_protocol_version_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        begin(ints, bytes);
+        let before = len(ssh.pending(ints, bytes));
+        test.assert_eq(ssh.feed(ints, bytes, "SSH-1.5-old\r\n"), wire.bad_identification());
+        test.assert_eq(ssh.wants(ints), ssh.want_nothing());
+        test.assert_eq(ssh.failure(ints), wire.bad_identification());
+        // Nothing is added: a client that is not speaking SSH 2 could not read a DISCONNECT.
+        test.assert_eq(len(ssh.pending(ints, bytes)), before);
+        test.assert_eq(ssh.feed(ints, bytes, "SSH-2.0-x\r\n"), wire.bad_identification());
+    }
+    return 0;
+}
+
+fn test_a_line_that_never_ends_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let junk = alloc_slice[r](300, byte_of('S'));
+        begin(ints, bytes);
+        test.assert_eq(ssh.feed(ints, bytes, junk[0..200]), 200);
+        test.assert_eq(ssh.wants(ints), ssh.want_input());
+        test.assert_eq(ssh.feed(ints, bytes, junk[0..100]), wire.bad_identification());
+    }
+    return 0;
+}
+
+fn test_the_line_may_arrive_a_byte_at_a_time_and_without_a_carriage_return() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        begin(ints, bytes);
+        let line = "SSH-2.0-test client\n";
+        var i = 0;
+        while i < len(line) {
+            test.assert_eq(ssh.feed(ints, bytes, line[i..i + 1]), 1);
+            i = i + 1;
+        }
+        test.assert_eq(ssh.failure(ints), 0);
+        // The line was taken: a packet is what is read next, and one too long is refused as a packet.
+        let long = alloc_slice[r](8, byte_of(255));
+        test.assert_eq(ssh.feed(ints, bytes, long), wire.packet_too_large());
+        test.assert(ends_with_disconnect(ints, bytes));
+    }
+    return 0;
+}
+
+fn test_packets_with_a_bad_length_or_padding_are_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let p = alloc_slice[r](32, byte_of(0));
+        // Shorter than the smallest packet.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        wire.put_u32(p, 0, 4);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..8]), wire.packet_malformed());
+        // Not a multiple of the block.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        wire.put_u32(p, 0, 13);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..8]), wire.packet_malformed());
+        // Padding shorter than four bytes.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        wire.put_u32(p, 0, 12);
+        p[4] = byte_of(3);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..16]), wire.packet_malformed());
+        // Padding that leaves no payload.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        p[4] = byte_of(11);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..16]), wire.packet_malformed());
+        // One byte more than the buffers were sized for.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        wire.put_u32(p, 0, ssh.packet_min() + 20);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..8]), wire.packet_too_large());
+    }
+    return 0;
+}
+
+fn test_a_client_with_no_algorithm_in_common_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        var n = kexinit(m, "diffie-hellman-group14-sha256", "ssh-ed25519", 0);
+        test.assert_eq(feed_packet(ints, bytes, m[0..n]), wire.no_common_algorithm());
+        test.assert(ends_with_disconnect(ints, bytes));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        n = kexinit(m, "curve25519-sha256", "rsa-sha2-512", 0);
+        test.assert_eq(feed_packet(ints, bytes, m[0..n]), wire.no_common_algorithm());
+    }
+    return 0;
+}
+
+fn test_a_kexinit_that_ends_early_or_late_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        let n = kexinit(m, "curve25519-sha256", "ssh-ed25519", 0);
+        var cut = 1;
+        while cut < n {
+            begin(ints, bytes);
+            ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+            test.assert_eq(feed_packet(ints, bytes, m[0..cut]), wire.decode());
+            cut = cut + 1;
+        }
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        test.assert_eq(feed_packet(ints, bytes, m[0..n + 1]), wire.decode());
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        test.assert(feed_packet(ints, bytes, m[0..n]) > 0);
+        test.assert_eq(ssh.failure(ints), 0);
+    }
+    return 0;
+}
+
+fn test_a_key_share_of_the_wrong_length_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        let n = kexinit(m, "curve25519-sha256", "ssh-ed25519", 0);
+        feed_packet(ints, bytes, m[0..n]);
+        var at = wire.put_byte(m, 0, 30);
+        at = wire.put_u32(m, at, 31);
+        test.assert_eq(feed_packet(ints, bytes, m[0..at + 31]), wire.bad_key_share());
+    }
+    return 0;
+}
+
+// The all-zero share is a point of low order: the shared secret would be zero whatever this server's key is.
+fn test_a_key_share_of_low_order_is_refused() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        let n = kexinit(m, "curve25519-sha256", "ssh-ed25519", 0);
+        feed_packet(ints, bytes, m[0..n]);
+        let share = alloc_slice[r](37, byte_of(0));
+        share[0] = byte_of(30);
+        share[4] = byte_of(32);
+        test.assert_eq(feed_packet(ints, bytes, share), wire.bad_key_share());
+    }
+    return 0;
+}
+
+// A good share is answered: the reply (31) and NEWKEYS (21) are pending, in the clear, after KEXINIT.
+fn test_a_good_key_share_is_answered_with_the_reply_and_newkeys() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        let n = kexinit(m, "curve25519-sha256@libssh.org", "ssh-ed25519", 0);
+        feed_packet(ints, bytes, m[0..n]);
+        ssh.sent(ints, bytes, len(ssh.pending(ints, bytes)));
+        let share = alloc_slice[r](37, byte_of(0));
+        share[0] = byte_of(30);
+        share[4] = byte_of(32);
+        share[5] = byte_of(9);
+        test.assert(feed_packet(ints, bytes, share) > 0);
+        test.assert_eq(ssh.failure(ints), 0);
+        let out = ssh.pending(ints, bytes);
+        test.assert_eq(int_of(out[5]), 31);
+        let second = 4 + wire.u32_at(out, 0);
+        test.assert_eq(int_of(out[second + 5]), 21);
+        test.assert_eq(second + 4 + wire.u32_at(out, second), len(out));
+        // A second key share where NEWKEYS is due.
+        test.assert_eq(feed_packet(ints, bytes, share), wire.unexpected_message());
+    }
+    return 0;
+}
+
+// A client that guessed another key exchange sends its first packet for that one: it is passed over, once.
+fn test_a_wrong_guess_is_passed_over_once() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        let n = kexinit(m, "diffie-hellman-group14-sha256,curve25519-sha256", "ssh-ed25519", 1);
+        test.assert(feed_packet(ints, bytes, m[0..n]) > 0);
+        let guess = alloc_slice[r](9, byte_of(0));
+        guess[0] = byte_of(30);
+        guess[4] = byte_of(4);
+        test.assert(feed_packet(ints, bytes, guess) > 0);
+        test.assert_eq(ssh.failure(ints), 0);
+        test.assert_eq(feed_packet(ints, bytes, guess), wire.bad_key_share());
+    }
+    return 0;
+}
+
+fn test_strict_key_exchange_refuses_a_packet_before_kexinit() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](512, byte_of(0));
+        let ignore = alloc_slice[r](5, byte_of(0));
+        ignore[0] = byte_of(2);
+        let n = kexinit(m, "curve25519-sha256,kex-strict-c-v00@openssh.com", "ssh-ed25519", 0);
+        // IGNORE first, then a strict KEXINIT: the prefix a truncation attack needs.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        test.assert(feed_packet(ints, bytes, ignore) > 0);
+        test.assert_eq(feed_packet(ints, bytes, m[0..n]), wire.strict_kex());
+        // KEXINIT first, then IGNORE where the key share is due.
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        test.assert(feed_packet(ints, bytes, m[0..n]) > 0);
+        test.assert_eq(feed_packet(ints, bytes, ignore), wire.strict_kex());
+        // Without the client's half, IGNORE during the exchange is allowed.
+        let loose = kexinit(m, "curve25519-sha256", "ssh-ed25519", 0);
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        test.assert(feed_packet(ints, bytes, ignore) > 0);
+        test.assert(feed_packet(ints, bytes, m[0..loose]) > 0);
+        test.assert(feed_packet(ints, bytes, ignore) > 0);
+        test.assert_eq(ssh.failure(ints), 0);
+    }
+    return 0;
+}
+
+fn test_nothing_but_the_key_exchange_is_taken_before_keys() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let m = alloc_slice[r](64, byte_of(0));
+        var kind = 5;
+        while kind <= 100 {
+            if kind != 20 && kind != 21 && kind != 30 {
+                begin(ints, bytes);
+                ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+                m[0] = byte_of(kind);
+                test.assert_eq(feed_packet(ints, bytes, m[0..24]), wire.unexpected_message());
+            }
+            kind = kind + 1;
+        }
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        m[0] = byte_of(21);
+        test.assert_eq(feed_packet(ints, bytes, m[0..1]), wire.unexpected_message());
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        m[0] = byte_of(1);
+        test.assert_eq(feed_packet(ints, bytes, m[0..13]), wire.peer_disconnected());
+        test.assert(ssh.ended_cleanly(ssh.failure(ints)));
+    }
+    return 0;
+}
+
+fn test_everything_answers_the_refusal_once_the_connection_is_over() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        begin(ints, bytes);
+        test.assert_eq(ssh.disconnect(ints, bytes), wire.host_closed());
+        test.assert_eq(ssh.feed(ints, bytes, "x"), wire.host_closed());
+        test.assert_eq(ssh.auth_decide(ints, bytes, true), wire.host_closed());
+        test.assert_eq(ssh.consume(ints, bytes, 1), wire.host_closed());
+        test.assert_eq(ssh.write(ints, bytes, "x"), wire.host_closed());
+        test.assert_eq(ssh.exit_session(ints, bytes, 0), wire.host_closed());
+        test.assert_eq(ssh.sent(ints, bytes, len(ssh.pending(ints, bytes))), wire.host_closed());
+        test.assert_eq(len(ssh.pending(ints, bytes)), 0);
+        test.assert_eq(len(ssh.received(ints, bytes)), 0);
+        test.assert_eq(ssh.session(ints), ssh.session_none());
+        ssh.forget(ints, bytes);
+        var i = 0;
+        var left = 0;
+        while i < len(bytes) {
+            left = left | int_of(bytes[i]);
+            i = i + 1;
+        }
+        test.assert_eq(left, 0);
+    }
+    return 0;
+}
+
+// The host's calls where there is nothing to answer do nothing.
+fn test_answers_nobody_asked_for_are_ignored() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        begin(ints, bytes);
+        test.assert_eq(ssh.auth_decide(ints, bytes, true), 0);
+        test.assert_eq(ssh.consume(ints, bytes, 5), 0);
+        test.assert_eq(ssh.write(ints, bytes, "x"), 0);
+        test.assert_eq(ssh.exit_session(ints, bytes, 0), 0);
+        test.assert(!ssh.authenticated(ints));
+        test.assert_eq(ssh.sent(ints, bytes, 1000000), 0);
+        test.assert_eq(len(ssh.pending(ints, bytes)), 0);
+        test.assert_eq(ssh.sent(ints, bytes, -5), 0);
+    }
+    return 0;
+}
+
+fn test_key_listed() -> [] int {
+    region r {
+        let list = alloc_slice[r](96, byte_of(1));
+        let key = alloc_slice[r](32, byte_of(2));
+        test.assert(!ssh.key_listed(list, key));
+        copy_into(list[64..96], key);
+        test.assert(ssh.key_listed(list, key));
+        test.assert(!ssh.key_listed(list[0..95], key));
+        test.assert(!ssh.key_listed(list[0..0], key));
+    }
+    return 0;
+}
+
+// 4,000 connections of bytes from a generator, after a good line: each is refused or still waiting, and none traps.
+// Half begin with a plausible length so that the bytes are read as a packet's content and not only as its length.
+fn test_bytes_from_a_generator_never_trap() -> [] int {
+    region r {
+        let ints = alloc_slice[r](ssh.ints_len(), 0);
+        let bytes = alloc_slice[r](bytes_len(), byte_of(0));
+        let junk = alloc_slice[r](256, byte_of(0));
+        var x = 88172645463325252;
+        var round = 0;
+        var refused = 0;
+        while round < 4000 {
+            begin(ints, bytes);
+            ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+            var i = 0;
+            while i < 256 {
+                x = x ^ x << 13 & 0x7fffffffffffffff;
+                x = x ^ x >> 7;
+                x = x ^ x << 17 & 0x7fffffffffffffff;
+                junk[i] = byte_of(x >> 11 & 255);
+                i = i + 1;
+            }
+            if round % 2 == 0 {
+                wire.put_u32(junk, 0, 8 * (1 + int_of(junk[3]) % 30));
+                junk[4] = byte_of(4 + int_of(junk[4]) % 4);
+                if round % 4 == 0 {
+                    junk[5] = byte_of(20 + int_of(junk[5]) % 12);
+                }
+            }
+            let fed = ssh.feed(ints, bytes, junk);
+            test.assert(fed == 256 || fed < 0);
+            if fed < 0 {
+                refused = refused + 1;
+                test.assert(!wire.equal(ssh.refusal_tag(fed), "unknown"));
+            }
+            round = round + 1;
+        }
+        test.assert(refused > 3000);
+    }
+    return 0;
+}

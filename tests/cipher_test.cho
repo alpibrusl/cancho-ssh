@@ -1,0 +1,83 @@
+edition 7;
+import std.test;
+import ssh_cipher as cipher;
+import ssh_test_support as support;
+import ssh_wire as wire;
+
+// The packet and its sealed form were made with Python's `cryptography` (ChaCha20 with a 16-byte nonce that is the
+// 64-bit counter and the sequence number, and Poly1305), following OpenSSH's PROTOCOL.chacha20poly1305: key
+// 00..3f, sequence number 0x01020304.
+fn clear() -> [] &static [byte] {
+    return "000000600468656c6c6f2c2063616e63686f2d6f733a2061207061636b65742074686174206973206c6f6e676572207468616e206f6e652043686143686120626c6f636b2c20746f2063726f73732036342062797465732e2e0000000000000000000000";
+}
+
+fn sealed() -> [] &static [byte] {
+    return "bc79801b92aa79deb77e0a89b70c4a9fc02f771b721734b613c90cbde617388a55324eac40b45361491f9726a7700bef1389b02fe121de2588256f2880231f66aed7284676dfe158bcdab7959cac124a4ce9a22b58eab11bf76ba4b2c600a3c97f50b62d67db362395d19c64badf0e3d57dbad72";
+}
+
+fn key_into[&k](key: &!k [byte]) -> [] int {
+    var i = 0;
+    while i < 64 {
+        key[i] = byte_of(i);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn test_seal_matches_reference() -> [] int {
+    region r {
+        let key = alloc_slice[r](64, byte_of(0));
+        let buf = alloc_slice[r](116, byte_of(0));
+        key_into(key);
+        test.assert_eq(support.unhex(clear(), buf), 100);
+        cipher.seal(key, 0x01020304, buf);
+        test.assert(support.hex_is(buf, sealed()));
+    }
+    return 0;
+}
+
+fn test_open_matches_reference() -> [] int {
+    region r {
+        let key = alloc_slice[r](64, byte_of(0));
+        let buf = alloc_slice[r](116, byte_of(0));
+        key_into(key);
+        support.unhex(sealed(), buf);
+        test.assert_eq(cipher.open_length(key, 0x01020304, buf[0..4]), 96);
+        test.assert_eq(cipher.open(key, 0x01020304, buf), 0);
+        test.assert(support.hex_is(buf[4..100], clear()[8..200]));
+    }
+    return 0;
+}
+
+// Every single-bit change of a sealed packet is refused, and so is the right packet under another sequence number.
+fn test_open_refuses_any_changed_bit() -> [] int {
+    region r {
+        let key = alloc_slice[r](64, byte_of(0));
+        let buf = alloc_slice[r](116, byte_of(0));
+        key_into(key);
+        var bit = 0;
+        while bit < 116 * 8 {
+            support.unhex(sealed(), buf);
+            buf[bit >> 3] = byte_of(int_of(buf[bit >> 3]) ^ 1 << (bit & 7));
+            test.assert_eq(cipher.open(key, 0x01020304, buf), wire.bad_mac());
+            bit = bit + 1;
+        }
+        support.unhex(sealed(), buf);
+        test.assert_eq(cipher.open(key, 0x01020305, buf), wire.bad_mac());
+    }
+    return 0;
+}
+
+// A draw replaces the key, and two draws differ.
+fn test_draw_moves_the_key() -> [] int {
+    region r {
+        let key = alloc_slice[r](32, byte_of(7));
+        let a = alloc_slice[r](32, byte_of(0));
+        let b = alloc_slice[r](32, byte_of(0));
+        cipher.draw(key, a);
+        test.assert(int_of(key[0]) != 7 || int_of(key[1]) != 7 || int_of(key[2]) != 7);
+        cipher.draw(key, b[0..16]);
+        test.assert(!wire.equal(a[0..16], b[0..16]));
+    }
+    return 0;
+}

@@ -1,0 +1,124 @@
+{
+  "entries": {
+    "0f4150453e641d782e1292a1661deaeb58bac66575214457d58488a07f52fd9e": {
+      "name": "terminal_size",
+      "stage_id": "bef530e0e2f464b70f601205abca0318bfe2a791ea179133814443e7f0e19dbb",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "13d351d9023cde39df234880caeac88c1142a2245bd89cc6dcf746c0519ccd74": {
+      "name": "on_open",
+      "stage_id": "f4606bb82767667539a921053ce75fb83107c9eff1e4e297e3e9ac678077d215",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "14dd7ddf3c7a5f67928468dc0a271c22e316231c91274209cab541ebb0b1b469": {
+      "name": "open_to_send",
+      "stage_id": "b4244ea1dceaab61c45186cc05aa1128d0fb36c477cc3adfd01a381f966a8a44",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "1b2f2cfaecfad15fc47e12a07433c2de70362a5591b33273ab0544a239064791": {
+      "name": "on_eof",
+      "stage_id": "fc9e7bcedecbbb80d2bd28bb73527b6e0cb7cd622f18bcf1e8b1db0168daf3f1",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "224a6c7cdb61b0bdba7d2eafc3029c8f5a78db793fc9661be4432de9bc3ee36e": {
+      "name": "session_none",
+      "stage_id": "d0aa4d0beecc0bb1f31b368ff97ddfef1ceb6158bffecb108260c1eb264da1da",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "3703f3e7e18d78dd1cba05d4607ccbcc6a3034adfc3541820efd8cb6d6717c26": {
+      "name": "session_command",
+      "stage_id": "7810a04f84e93f081f1699a63442dca6359b393ebbbd7cc5119ae1106bdb9221",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "4788f060baabc7df0e829f81185f4026da3971299e2e7ac7bf7dc52f41ddac78": {
+      "name": "on_window_adjust",
+      "stage_id": "400b3e2bcb78e4f48dfc41fd0b405c4b5bc57bb73f9d8ed01d1ad69663c6e1fe",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "4ae278e74f952f5f5ebafa9ecf86aa530f267f34d5d6787643ce66cb97437086": {
+      "name": "on_global_request",
+      "stage_id": "c4aa391ebdf14e7501c6db8c7456e3cde14de32ad31e98d42ba6027768f5b1cc",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "51e43832c32189284244abcf6191673b86fd4d7cc37511116150892d90c0c6fa": {
+      "name": "consume",
+      "stage_id": "3161819c20dff43836d3be4087c414916f7ad88468979a852fd03ffc46301dbe",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "5244f02f75354b1e96fc5cac2f5f7b6d49fc20f1c6e22ca479685cdf81817ba6": {
+      "name": "exit_session",
+      "stage_id": "4abe5788092686b483997aa4781641d8abeba7c96b622df19e54fffe0db3b09f",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "5772abf0ccad7be9a0daf369a8d0f7f8b5e62290caeb379ce279c62b7003cca7": {
+      "name": "data_max",
+      "stage_id": "5a4a10b4419423687b995338d1338ca1131676a96822afb5f95f8424a2a36278",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "5897078d3e4dcb29d8fc72278b04056730909016c2b03d5586124c94b30917aa": {
+      "name": "on_data",
+      "stage_id": "385df750ad8b1cf5773c799e21d151ad6f2ee5df9da6930f626ae9ab9373bf7b",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "6d376d4731cd4665ed21d725553d837abf432de56f59fd74bb2735edad59f40d": {
+      "name": "on_close",
+      "stage_id": "b8e64e6a52a1dc717000a55bd7ac231aedacc68914bcd4309704f6ddbf57e34a",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "79b52ea7997c3d85913ded57d04818a89cd5e73b1175d08f3795756c5ba18901": {
+      "name": "for_open_channel",
+      "stage_id": "8ce60c0119c9ab0f52138d495611b4845b049e7ea392ac6cef6c074410f8cc52",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "a15da18c80a421ae6b40f9e8427c374a23ff2420998d1daae88a17d7b5824464": {
+      "name": "send_numbers",
+      "stage_id": "45bcaf67e3747fa0c9095cec9ed0fa04164d628bf89b0378cbd79658bc00cedc",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "adc548095a1795ce51b2d7d0b31d347836396c64a962689149c7a21816badbfc": {
+      "name": "on_request",
+      "stage_id": "559f8cf46ab3a05a8f679a292e75e87c0142dfa0c01192431ea9ec8132668d5b",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "de290c8019f68111f8e315b86d1a507db163996ea4c910e33d2c8fbece6315ed": {
+      "name": "adjust",
+      "stage_id": "820eefd7aafd720f2c2c52b13f39f8fda9cb79ac3c0227de573097a092299e55",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "e84039996dc7803d9775d3b6e63e0c0d7c687c60cb9364a3a989b8c490b18b3d": {
+      "name": "write",
+      "stage_id": "ad78aebec7aaffe3037c5f2274715fc2bc91f9e756c305c658bdd8404671833a",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "f73cabcb86391cf20390cc47c0d917063f6c1948269d343530d7d4cc4034bba2": {
+      "name": "window",
+      "stage_id": "ad5b887619f5cae29c830e8140737863f4c5049554cef70f36025932ee225acf",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    },
+    "fa19dfbadaf1ec62324857e1368bd3d883c99c4be8a63a50f22b5a883524a83c": {
+      "name": "session_shell",
+      "stage_id": "1bc01f8a83a957f4ba0d9ea00b7fc5a1219686f874f369ac9dd99bf113914d12",
+      "source_hash": "329a34cb54d2c0626ec933950ef46ba570acd4f0fc5d2adfbf34b183c908cd83",
+      "uses_std": false
+    }
+  }
+}

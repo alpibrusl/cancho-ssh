@@ -1,0 +1,298 @@
+edition 7;
+module ssh_kex;
+import std.ed25519;
+import std.x25519;
+import ssh_cipher as cipher;
+import ssh_sha256 as sha;
+import ssh_slot as slot;
+import ssh_wire as wire;
+
+// `ssh_kex` -- the key exchange (RFC 4253 sections 7 and 8, RFC 8731, RFC 5656 section 4): KEXINIT both ways,
+// `curve25519-sha256`, the exchange hash signed with the host key, the keys of the cipher, NEWKEYS, and OpenSSH's
+// strict key exchange. The first exchange and a re-key the client starts are the same code.
+//
+// The ephemeral secret, the shared secret and the keys are secret. The shared secret's leading zero bytes decide
+// the length of its `mpint` (`wire.mpint_shape`), as the encoding requires of every implementation; nothing else
+// here depends on a secret's value.
+
+pub fn identification() -> [] &static [byte] {
+    return "SSH-2.0-cancho_0.1";
+}
+
+fn kex_names() -> [] &static [byte] {
+    return "curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-s-v00@openssh.com";
+}
+
+fn kex_name() -> [] &static [byte] {
+    return "curve25519-sha256";
+}
+
+fn kex_name_libssh() -> [] &static [byte] {
+    return "curve25519-sha256@libssh.org";
+}
+
+pub fn host_key_name() -> [] &static [byte] {
+    return "ssh-ed25519";
+}
+
+fn cipher_name() -> [] &static [byte] {
+    return "chacha20-poly1305@openssh.com";
+}
+
+// Never chosen: the one cipher has a tag of its own, and the MAC negotiated beside it is not used (OpenSSH's
+// PROTOCOL.chacha20poly1305). A name is offered because some clients refuse a server that offers none.
+fn mac_name() -> [] &static [byte] {
+    return "hmac-sha2-256";
+}
+
+// This server's KEXINIT payload, for the cookie in `bytes`, into `out` (at least 320 bytes); answers its length.
+// It is built again for the exchange hash rather than kept.
+fn our_kexinit[&b, &o](bytes: &b [byte], out: &!o [byte]) -> [] int {
+    var at = wire.put_byte(out, 0, wire.msg_kexinit());
+    at = wire.put_bytes(out, at, bytes[slot.b_cookie()..slot.b_cookie() + 16]);
+    at = wire.put_string(out, at, kex_names());
+    at = wire.put_string(out, at, host_key_name());
+    at = wire.put_string(out, at, cipher_name());
+    at = wire.put_string(out, at, cipher_name());
+    at = wire.put_string(out, at, mac_name());
+    at = wire.put_string(out, at, mac_name());
+    at = wire.put_string(out, at, "none");
+    at = wire.put_string(out, at, "none");
+    at = wire.put_string(out, at, "");
+    at = wire.put_string(out, at, "");
+    at = wire.put_byte(out, at, 0);
+    return wire.put_u32(out, at, 0);
+}
+
+// Draws a cookie and queues this server's KEXINIT.
+pub fn send_kexinit[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
+    var sent = 0;
+    cipher.draw(bytes[slot.b_generator()..slot.b_generator() + 32], bytes[slot.b_cookie()..slot.b_cookie() + 16]);
+    region r {
+        let mine = alloc_slice[r](320, byte_of(0));
+        let n = our_kexinit(bytes, mine);
+        sent = slot.queue_packet(ints, bytes, mine[0..n]);
+    }
+    if sent < 0 {
+        return sent;
+    }
+    slot.set_flag(ints, slot.f_kexinit_sent());
+    return 0;
+}
+
+fn hash_string[&st, &s](st: &!st [int], s: &s [byte]) -> [] int {
+    sha.update_u32(st, len(s));
+    return sha.update(st, s);
+}
+
+// The client's KEXINIT, the payload of `n` bytes at `at`. Agrees the algorithms or refuses, answers with this
+// server's KEXINIT if it has not sent one (a re-key), and begins the exchange hash.
+pub fn on_kexinit[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    let first = ints[slot.i_phase()] == slot.phase_kex() && ints[slot.i_kex()] == slot.kex_wait_init();
+    let again = ints[slot.i_phase()] > slot.phase_kex() && ints[slot.i_kex()] == slot.kex_idle();
+    if !first && !again {
+        return wire.unexpected_message();
+    }
+    // Ten name-lists after the type and the cookie, then a flag and a reserved word.
+    var guessed = false;
+    var agreed = true;
+    var strict = false;
+    var guess_right = true;
+    var p = 17;
+    var list = 0;
+    var whole = n >= 17;
+    while list < 10 && whole {
+        let l = wire.string_len(bytes[at..at + n], p);
+        if l < 0 {
+            whole = false;
+        } else {
+            let names = bytes[at + p + 4..at + p + 4 + l];
+            if list == 0 {
+                if !wire.listed(names, kex_name()) && !wire.listed(names, kex_name_libssh()) {
+                    agreed = false;
+                }
+                strict = wire.listed(names, "kex-strict-c-v00@openssh.com");
+                let guess = wire.first_name(names);
+                if !wire.equal(guess, kex_name()) && !wire.equal(guess, kex_name_libssh()) {
+                    guess_right = false;
+                }
+            }
+            if list == 1 {
+                if !wire.listed(names, host_key_name()) {
+                    agreed = false;
+                }
+                if !wire.equal(wire.first_name(names), host_key_name()) {
+                    guess_right = false;
+                }
+            }
+            if list == 2 || list == 3 {
+                if !wire.listed(names, cipher_name()) {
+                    agreed = false;
+                }
+            }
+            if list == 6 || list == 7 {
+                if !wire.listed(names, "none") {
+                    agreed = false;
+                }
+            }
+            p = p + 4 + l;
+            list = list + 1;
+        }
+    }
+    if !whole || p + 5 != n {
+        return wire.decode();
+    }
+    guessed = int_of(bytes[at + p]) != 0;
+    if !agreed {
+        return wire.no_common_algorithm();
+    }
+    if first && strict {
+        // Strict key exchange: the client's KEXINIT is the first packet it sent.
+        if ints[slot.i_packet_seq()] != 0 {
+            return wire.strict_kex();
+        }
+        slot.set_flag(ints, slot.f_strict());
+    }
+    if guessed && !guess_right {
+        slot.set_flag(ints, slot.f_skip_guess());
+    }
+    if !slot.has(ints, slot.f_kexinit_sent()) {
+        let sent = send_kexinit(ints, bytes);
+        if sent < 0 {
+            return sent;
+        }
+    }
+    let st = ints[slot.i_sha()..slot.i_sha() + sha.state_len()];
+    sha.init(st);
+    hash_string(st, bytes[slot.b_vc()..slot.b_vc() + ints[slot.i_vc_len()]]);
+    hash_string(st, identification());
+    hash_string(st, bytes[at..at + n]);
+    region r {
+        let mine = alloc_slice[r](320, byte_of(0));
+        let m = our_kexinit(bytes, mine);
+        hash_string(st, mine[0..m]);
+    }
+    ints[slot.i_kex()] = slot.kex_wait_ecdh();
+    return 0;
+}
+
+// The shared secret `k` as an `mpint`, into the hash.
+fn hash_mpint[&st, &k](st: &!st [int], k: &k [byte]) -> [] int {
+    let shape = wire.mpint_shape(k);
+    let skip = shape >> 1;
+    let lead = shape & 1;
+    sha.update_u32(st, lead + len(k) - skip);
+    if lead == 1 {
+        sha.update_byte(st, 0);
+    }
+    return sha.update(st, k[skip..len(k)]);
+}
+
+// The 64-byte key for `letter` (RFC 4253 section 7.2): HASH(K || H || letter || session_id), then
+// HASH(K || H || the first half).
+fn derive[&st, &k, &h, &s, &o](st: &!st [int], k: &k [byte], h: &h [byte], session: &s [byte], letter: int, out: &!o [byte]) -> [] int {
+    sha.init(st);
+    hash_mpint(st, k);
+    sha.update(st, h);
+    sha.update_byte(st, letter);
+    sha.update(st, session);
+    sha.final(st, out[0..32]);
+    sha.init(st);
+    hash_mpint(st, k);
+    sha.update(st, h);
+    sha.update(st, out[0..32]);
+    return sha.final(st, out[32..64]);
+}
+
+// The client's key share (`SSH_MSG_KEX_ECDH_INIT`), the payload of `n` bytes at `at`: this server's share, the
+// exchange hash and its signature, the reply and NEWKEYS, and the new keys. The reply and NEWKEYS go out under the
+// keys in use; what follows them is under the new one.
+pub fn on_ecdh_init[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -> [] int {
+    if ints[slot.i_kex()] != slot.kex_wait_ecdh() {
+        return wire.unexpected_message();
+    }
+    if wire.string_len(bytes[at..at + n], 1) != 32 || n != 37 {
+        return wire.bad_key_share();
+    }
+    var result = 0;
+    region r {
+        let secret = alloc_slice[r](32, byte_of(0));
+        let mine = alloc_slice[r](32, byte_of(0));
+        let k = alloc_slice[r](32, byte_of(0));
+        let h = alloc_slice[r](32, byte_of(0));
+        let sig = alloc_slice[r](64, byte_of(0));
+        let host_key = alloc_slice[r](51, byte_of(0));
+        let reply = alloc_slice[r](192, byte_of(0));
+        let work = alloc_slice[r](sha.state_len(), 0);
+        cipher.draw(bytes[slot.b_generator()..slot.b_generator() + 32], secret);
+        x25519.public_key(secret, mine);
+        if x25519.scalarmult(secret, bytes[at + 5..at + 37], k) != 0 {
+            result = wire.bad_key_share();
+        }
+        slot.zero(secret, 0, 32);
+        if result == 0 {
+            var q = wire.put_string(host_key, 0, host_key_name());
+            q = wire.put_string(host_key, q, bytes[slot.b_host_public()..slot.b_host_public() + 32]);
+            let st = ints[slot.i_sha()..slot.i_sha() + sha.state_len()];
+            hash_string(st, host_key);
+            hash_string(st, bytes[at + 5..at + 37]);
+            hash_string(st, mine);
+            hash_mpint(st, k);
+            sha.final(st, h);
+            sha.forget(st);
+            if !slot.has(ints, slot.f_first_kex_done()) {
+                copy_into(bytes[slot.b_session_id()..slot.b_session_id() + 32], h);
+            }
+            ed25519.sign_with_public(bytes[slot.b_seed()..slot.b_seed() + 32], bytes[slot.b_host_public()..slot.b_host_public() + 32], h, sig);
+            derive(work, k, h, bytes[slot.b_session_id()..slot.b_session_id() + 32], 'C', bytes[slot.b_next_read()..slot.b_next_read() + 64]);
+            derive(work, k, h, bytes[slot.b_session_id()..slot.b_session_id() + 32], 'D', bytes[slot.b_next_write()..slot.b_next_write() + 64]);
+            sha.forget(work);
+            slot.zero(k, 0, 32);
+            var p = wire.put_byte(reply, 0, wire.msg_kex_ecdh_reply());
+            p = wire.put_string(reply, p, host_key);
+            p = wire.put_string(reply, p, mine);
+            p = wire.put_u32(reply, p, 83);
+            p = wire.put_string(reply, p, host_key_name());
+            p = wire.put_string(reply, p, sig);
+            result = slot.queue_packet(ints, bytes, reply[0..p]);
+            if result == 0 {
+                reply[0] = byte_of(wire.msg_newkeys());
+                result = slot.queue_packet(ints, bytes, reply[0..1]);
+            }
+        }
+    }
+    if result < 0 {
+        return result;
+    }
+    copy_into(bytes[slot.b_write_key()..slot.b_write_key() + 64], bytes[slot.b_next_write()..slot.b_next_write() + 64]);
+    slot.zero(bytes, slot.b_next_write(), 64);
+    slot.set_flag(ints, slot.f_write_protected());
+    if slot.has(ints, slot.f_strict()) {
+        ints[slot.i_write_seq()] = 0;
+    }
+    ints[slot.i_kex()] = slot.kex_wait_newkeys();
+    return 0;
+}
+
+// The client's NEWKEYS: what it sends from here is under the new key.
+pub fn on_newkeys[&i, &b](ints: &!i [int], bytes: &!b [byte], n: int) -> [] int {
+    if ints[slot.i_kex()] != slot.kex_wait_newkeys() {
+        return wire.unexpected_message();
+    }
+    if n != 1 {
+        return wire.decode();
+    }
+    copy_into(bytes[slot.b_read_key()..slot.b_read_key() + 64], bytes[slot.b_next_read()..slot.b_next_read() + 64]);
+    slot.zero(bytes, slot.b_next_read(), 64);
+    slot.set_flag(ints, slot.f_read_protected());
+    if slot.has(ints, slot.f_strict()) {
+        ints[slot.i_read_seq()] = 0;
+    }
+    slot.set_flag(ints, slot.f_first_kex_done());
+    slot.clear_flag(ints, slot.f_kexinit_sent());
+    ints[slot.i_kex()] = slot.kex_idle();
+    if ints[slot.i_phase()] == slot.phase_kex() {
+        ints[slot.i_phase()] = slot.phase_service();
+    }
+    return 0;
+}

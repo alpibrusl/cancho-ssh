@@ -1,0 +1,422 @@
+edition 7;
+module ssh_wire;
+
+// `ssh_wire` -- the data types of RFC 4251 section 5 (`uint32`, `string`, `name-list`, `mpint`), read and written, the
+// message numbers, and every refusal code of the package (`docs/design.md` section 6). The lowest module: it imports
+// nothing.
+//
+// A reader never indexes before it has compared a length with what is there: `string_len` answers -1 for a string
+// that is not whole, and the caller refuses. A writer is given a slice the caller sized, and answers the place after
+// what it wrote.
+
+// ---- Refusals ----
+
+pub fn ok() -> [] int {
+    return 0;
+}
+
+// The first line is not `SSH-2.0-...`, or is longer than 255 bytes.
+pub fn bad_identification() -> [] int {
+    return -1;
+}
+
+// A packet longer than the host's buffers were sized for.
+pub fn packet_too_large() -> [] int {
+    return -2;
+}
+
+// A packet whose length or padding is not one RFC 4253 section 6 allows.
+pub fn packet_malformed() -> [] int {
+    return -3;
+}
+
+// The tag of a packet is not the one its bytes have.
+pub fn bad_mac() -> [] int {
+    return -4;
+}
+
+// A message that ends before its fields do, or a field out of range.
+pub fn decode() -> [] int {
+    return -5;
+}
+
+// A message that may not arrive in this state.
+pub fn unexpected_message() -> [] int {
+    return -6;
+}
+
+// The client offers none of the one algorithm of a kind this server has.
+pub fn no_common_algorithm() -> [] int {
+    return -7;
+}
+
+// A key share that is not 32 bytes, or one whose shared secret is zero.
+pub fn bad_key_share() -> [] int {
+    return -8;
+}
+
+// Strict key exchange was agreed and the client sent something else before NEWKEYS.
+pub fn strict_kex() -> [] int {
+    return -9;
+}
+
+// A sequence number would wrap: the client did not re-key in 2^32 packets.
+pub fn sequence_exhausted() -> [] int {
+    return -10;
+}
+
+// Too many authentication requests failed.
+pub fn auth_tries() -> [] int {
+    return -11;
+}
+
+// A service other than `ssh-userauth` was requested.
+pub fn unknown_service() -> [] int {
+    return -12;
+}
+
+// The client sent DISCONNECT: the ordinary end of a connection.
+pub fn peer_disconnected() -> [] int {
+    return -13;
+}
+
+// A channel message for a channel that is not open, or more data than the window allowed.
+pub fn channel_violation() -> [] int {
+    return -14;
+}
+
+// `start` was given slices too short, or a key or entropy of the wrong length.
+pub fn bad_start() -> [] int {
+    return -15;
+}
+
+// The connection is over and the host called something that needs one.
+pub fn closed() -> [] int {
+    return -16;
+}
+
+// The host ended the connection (`disconnect`).
+pub fn host_closed() -> [] int {
+    return -17;
+}
+
+// A reply did not fit in the output buffer: the host did not send what was waiting.
+pub fn output_full() -> [] int {
+    return -18;
+}
+
+// The stable name of a refusal code.
+pub fn refusal_tag(code: int) -> [] &static [byte] {
+    if code == 0 {
+        return "ok";
+    }
+    if code == -1 {
+        return "ssh-bad-identification";
+    }
+    if code == -2 {
+        return "ssh-packet-too-large";
+    }
+    if code == -3 {
+        return "ssh-packet-malformed";
+    }
+    if code == -4 {
+        return "ssh-bad-mac";
+    }
+    if code == -5 {
+        return "ssh-decode";
+    }
+    if code == -6 {
+        return "ssh-unexpected-message";
+    }
+    if code == -7 {
+        return "ssh-no-common-algorithm";
+    }
+    if code == -8 {
+        return "ssh-bad-key-share";
+    }
+    if code == -9 {
+        return "ssh-strict-kex";
+    }
+    if code == -10 {
+        return "ssh-sequence-exhausted";
+    }
+    if code == -11 {
+        return "ssh-auth-tries";
+    }
+    if code == -12 {
+        return "ssh-unknown-service";
+    }
+    if code == -13 {
+        return "ssh-peer-disconnected";
+    }
+    if code == -14 {
+        return "ssh-channel-violation";
+    }
+    if code == -15 {
+        return "ssh-bad-start";
+    }
+    if code == -16 {
+        return "ssh-closed";
+    }
+    if code == -17 {
+        return "ssh-host-closed";
+    }
+    if code == -18 {
+        return "ssh-output-full";
+    }
+    return "unknown";
+}
+
+// The reason code of DISCONNECT (RFC 4253 section 11.1) that says a refusal to the client.
+pub fn disconnect_reason(code: int) -> [] int {
+    if code == no_common_algorithm() || code == bad_key_share() {
+        return 3;
+    }
+    if code == bad_mac() {
+        return 5;
+    }
+    if code == unknown_service() {
+        return 7;
+    }
+    if code == bad_identification() {
+        return 8;
+    }
+    if code == host_closed() {
+        return 11;
+    }
+    if code == auth_tries() {
+        return 14;
+    }
+    return 2;
+}
+
+// ---- Message numbers (RFC 4250 section 4.1) ----
+
+pub fn msg_disconnect() -> [] int {
+    return 1;
+}
+
+pub fn msg_ignore() -> [] int {
+    return 2;
+}
+
+pub fn msg_unimplemented() -> [] int {
+    return 3;
+}
+
+pub fn msg_debug() -> [] int {
+    return 4;
+}
+
+pub fn msg_service_request() -> [] int {
+    return 5;
+}
+
+pub fn msg_service_accept() -> [] int {
+    return 6;
+}
+
+pub fn msg_kexinit() -> [] int {
+    return 20;
+}
+
+pub fn msg_newkeys() -> [] int {
+    return 21;
+}
+
+pub fn msg_kex_ecdh_init() -> [] int {
+    return 30;
+}
+
+pub fn msg_kex_ecdh_reply() -> [] int {
+    return 31;
+}
+
+pub fn msg_userauth_request() -> [] int {
+    return 50;
+}
+
+pub fn msg_userauth_failure() -> [] int {
+    return 51;
+}
+
+pub fn msg_userauth_success() -> [] int {
+    return 52;
+}
+
+pub fn msg_userauth_pk_ok() -> [] int {
+    return 60;
+}
+
+pub fn msg_global_request() -> [] int {
+    return 80;
+}
+
+pub fn msg_request_failure() -> [] int {
+    return 82;
+}
+
+pub fn msg_channel_open() -> [] int {
+    return 90;
+}
+
+pub fn msg_channel_open_confirmation() -> [] int {
+    return 91;
+}
+
+pub fn msg_channel_open_failure() -> [] int {
+    return 92;
+}
+
+pub fn msg_channel_window_adjust() -> [] int {
+    return 93;
+}
+
+pub fn msg_channel_data() -> [] int {
+    return 94;
+}
+
+pub fn msg_channel_extended_data() -> [] int {
+    return 95;
+}
+
+pub fn msg_channel_eof() -> [] int {
+    return 96;
+}
+
+pub fn msg_channel_close() -> [] int {
+    return 97;
+}
+
+pub fn msg_channel_request() -> [] int {
+    return 98;
+}
+
+pub fn msg_channel_success() -> [] int {
+    return 99;
+}
+
+pub fn msg_channel_failure() -> [] int {
+    return 100;
+}
+
+// ---- Reading ----
+
+// The `uint32` at `b[at..at + 4]`. The caller has checked that it is there.
+pub fn u32_at[&b](b: &b [byte], at: int) -> [] int {
+    return int_of(b[at]) << 24 | int_of(b[at + 1]) << 16 | int_of(b[at + 2]) << 8 | int_of(b[at + 3]);
+}
+
+// Is there a whole `uint32` at `at`?
+pub fn has_u32[&b](b: &b [byte], at: int) -> [] bool {
+    return at >= 0 && at + 4 <= len(b);
+}
+
+// The length of the `string` at `at`, whose bytes are then `b[at + 4..at + 4 + n]`; -1 if it is not whole.
+pub fn string_len[&b](b: &b [byte], at: int) -> [] int {
+    if at < 0 || at + 4 > len(b) {
+        return -1;
+    }
+    let n = u32_at(b, at);
+    if n > len(b) - at - 4 {
+        return -1;
+    }
+    return n;
+}
+
+// Are `x` and `y` the same bytes? Not for secrets: it stops at the first difference.
+pub fn equal[&x, &y](x: &x [byte], y: &y [byte]) -> [] bool {
+    if len(x) != len(y) {
+        return false;
+    }
+    var same = true;
+    var i = 0;
+    while i < len(x) && same {
+        if int_of(x[i]) != int_of(y[i]) {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}
+
+// Is `name` one of the names of the comma-separated `list`?
+pub fn listed[&l, &n](list: &l [byte], name: &n [byte]) -> [] bool {
+    var found = false;
+    var from = 0;
+    var i = 0;
+    while i <= len(list) && !found {
+        var at_end = i == len(list);
+        if !at_end {
+            at_end = int_of(list[i]) == ',';
+        }
+        if at_end {
+            if equal(list[from..i], name) {
+                found = true;
+            }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    return found;
+}
+
+// The first name of `list`, which is what a client that guesses has guessed.
+pub fn first_name[&l](list: &l [byte]) -> [] &l [byte] {
+    var i = 0;
+    var stop = false;
+    while i < len(list) && !stop {
+        if int_of(list[i]) == ',' {
+            stop = true;
+        } else {
+            i = i + 1;
+        }
+    }
+    return list[0..i];
+}
+
+// ---- Writing ----
+
+pub fn put_byte[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    out[at] = byte_of(v & 255);
+    return at + 1;
+}
+
+pub fn put_u32[&o](out: &!o [byte], at: int, v: int) -> [] int {
+    out[at] = byte_of(v >> 24 & 255);
+    out[at + 1] = byte_of(v >> 16 & 255);
+    out[at + 2] = byte_of(v >> 8 & 255);
+    out[at + 3] = byte_of(v & 255);
+    return at + 4;
+}
+
+// `s` as it is, with no length.
+pub fn put_bytes[&o, &s](out: &!o [byte], at: int, s: &s [byte]) -> [] int {
+    copy_into(out[at..at + len(s)], s);
+    return at + len(s);
+}
+
+// `s` as a `string`: its length, then its bytes.
+pub fn put_string[&o, &s](out: &!o [byte], at: int, s: &s [byte]) -> [] int {
+    return put_bytes(out, put_u32(out, at, len(s)), s);
+}
+
+// The bytes of an `mpint` whose magnitude is `value`, big-endian: how many of `value`'s leading bytes to leave out,
+// and whether a zero byte goes in front (the first byte kept has its high bit set). Answers `skip * 2 + lead`.
+// `value` is not all zeros: a zero shared secret was refused before this.
+pub fn mpint_shape[&v](value: &v [byte]) -> [] int {
+    var skip = 0;
+    var stop = false;
+    while skip < len(value) - 1 && !stop {
+        if int_of(value[skip]) != 0 {
+            stop = true;
+        } else {
+            skip = skip + 1;
+        }
+    }
+    var lead = 0;
+    if int_of(value[skip]) >= 128 {
+        lead = 1;
+    }
+    return skip * 2 + lead;
+}
