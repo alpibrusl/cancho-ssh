@@ -1,77 +1,100 @@
-# On cancho-os: what the kernel provides, and the loop
+# On cancho-os: where this fits, and what is in the way
 
-> **Status: not run on the kernel.** cancho-os has no network yet (it is being written), and this document is
-> written without its sources. What is claimed is what was run: the package builds for `aarch64-none-elf`, and that
-> object, linked with a stand-in for the drivers, runs on AArch64 under qemu and is logged in to by OpenSSH's client
-> (`scripts/bare_run.py`, [`design.md`](design.md) section 9). Everything about the kernel itself below is what it
-> will have to do, not something observed. Correct this document when the kernel says otherwise.
+> **Status: not in the kernel.** Nothing here has been run on cancho-os. This document was first written
+> without the kernel's sources and said so; it is now written from them, at
+> [`1c82b62`](https://github.com/alpibrusl/cancho-os/commit/1c82b626474d0f0b108b29f0fbddce682681f387) of
+> cancho-os (`main`), and every statement about the kernel is marked **[read]** (from that source) or is a
+> proposal. What was run is the package itself: it builds for `aarch64-none-elf`, and that object, linked with a
+> stand-in for the drivers, runs on AArch64 under qemu and is logged in to by OpenSSH's client
+> ([`design.md`](design.md) section 9).
+>
+> *(Corrected: the first version listed "a TCP byte stream" and "a hardware generator" as things the kernel
+> would have to write. It has both, sections 1 and 2. What it lacks is narrower, section 3.)*
 
 ---
 
-## 1. What the kernel provides
+## 1. What the kernel already has **[read]**
 
-| | what | what goes wrong without it |
-|---|---|---|
-| a byte stream | one TCP connection: bytes that arrived, bytes to send, and whether the peer has gone | nothing works |
-| 32 bytes of entropy a connection | from the SoC's hardware generator, read after it has warmed up | **the ephemeral keys are predictable and every session can be decrypted**; nothing in the package can detect a weak source |
-| a host key | a 32-byte Ed25519 seed and its public key (`std.ed25519.public_key_from_seed`, once at boot) | clients cannot tell this machine from an impostor |
-| who may log in | a list of 32-byte Ed25519 public keys | nobody can log in, or everybody |
-| a timer | to disconnect a client that does not log in, or goes silent | a client holds the one connection for ever |
-| a shell | what the UART shell already is: it echoes and edits the line itself | a session has nothing to run |
+| what this package needs | what the kernel has |
+|---|---|
+| a byte stream | `src/inet.cho`: TCP whose state is the caller's. `tcp_read(tcp, inbox, c, into, most)` takes what arrived, `tcp_write(tcp, bufs, c, data, at, n)` answers how much it had room for, `tcp_flush` makes the segment, `tcp_close` ends, `tcp_state` is 2 while open and 3 once the other end has finished |
+| a timer | `tcp_quiet(tcp, c, now)`: how long a connection has been silent. The shell on port 23 hangs up after 300,000 ms |
+| entropy | a pool of sixteen 32-bit words at `k[4136..]`, `k[37]` of them ready, filled by `rng_fill` from virtio-rng (QEMU `virt`) or the BCM2835 generator (Pi 3). `docs/random.md` |
+| a shell with one way out | every command's output goes through `putc`, which fills a queue (`k[40..]`, 4,096 bytes) while a line from the network runs |
+| the place | `session` in `src/network.cho`: it moves bytes between one connection and two things, the line being typed (`rline`) and that queue. It touches no hardware. **SSH goes exactly there**, between `tcp_read`/`tcp_write` and those two |
 
-**The host key is the hard one.** A seed compiled into the image is the same on every board that boots the image
-and is public if the image is. A seed made on first boot needs somewhere to be kept (the SD card) and entropy at
-first boot. A seed made at every boot makes every client's `known_hosts` wrong after every restart, which trains
-people to ignore the warning. This is the kernel's decision; the package takes whatever 32 bytes it is given.
+The kernel's own documents ask for this: `docs/network.md` section 8 says port 23 "is here to be replaced by SSH,
+and it must be gone, or behind SSH, before the kernel can move a servo", and section 11 lists "SSH, as its own
+package" next.
 
-## 2. Memory
+## 2. How it would go in (a proposal)
 
-All of it is the two slices given to `ssh.start`:
-
-- `ints`: `ssh.ints_len()` words, 1,024 bytes.
-- `bytes`: `ssh.bytes_len(packet)` bytes. For `packet` = 8,192 that is 17,480; the smallest, 4,096, is 9,288.
-
-A region is one 64 KiB chunk, so a connection fits in a region with room for the kernel's own buffers
-(`tests/probes/bare.cho` has the connection, a shell and an input buffer in one). The package's own functions open
-short regions for their work areas; the largest is the signed part of an authentication request, at most the
-packet size plus 36 bytes.
-
-## 3. The loop
-
-`tests/probes/bare.cho` is this loop, built by the gate; read it there. Its two rules were both found by getting
-them wrong:
-
-1. **Read the network only when nothing else moved.** A loop that reads first blocks on a client that is itself
-   waiting, for output the loop had not written yet.
-2. **Keep what `feed` did not take.** `feed` takes what its buffer has room for and says how much. The rest must be
-   given again later; dropping it desynchronises the stream, and the connection then hangs waiting for a packet
-   whose tail never arrives.
+`session` today: read a byte from the connection, build a line, return 1 when it is whole; write the queue to the
+connection as it has room. With SSH between, the same function becomes the loop of `tests/probes/bare.cho`:
 
 ```
-loop:
-    give feed() what was received and not yet taken
-    send pending() to the client; sent()
-    want_auth  -> auth_decide(key_listed(allowed, auth_key()))
-    a session began (session_count() changed) -> start the shell for it
-    shell output -> write()
-    want_data  -> the shell takes received(); consume()
-    peer_eof() -> the shell's input has ended
-    the shell exited and its output is written -> exit_session(status)
-    want_nothing and nothing pending -> close; forget()
-    nothing moved -> wait for the network (or the timer)
+    tcp_read into a small buffer        ->  ssh.feed            (keep what it did not take)
+    ssh.pending                         ->  tcp_write, ssh.sent (only what tcp_write took)
+    ssh.wants == want_auth              ->  ssh.auth_decide(ssh.key_listed(allowed, ssh.auth_key))
+    ssh.wants == want_data              ->  ssh.received into rline, a line at a time; ssh.consume
+    the output queue k[40..]            ->  ssh.write           (drop from the queue only what it took)
+    `exit`, or tcp_quiet past the limit ->  ssh.exit_session / ssh.disconnect, then tcp_close
+    tcp_state not 2 or 3                ->  ssh.forget
 ```
 
-With no terminal requested (`ssh host command`, or `ssh -T`), lines end with a line feed and nothing is echoed. With
-one (`ssh host`), the client sends a carriage return for Enter and echoes nothing, so the shell echoes and ends its
-lines with CR LF, as it does on a UART. `ssh.terminal(ints)` says which.
+- **The files.** `build.sh` names the kernel's sources one by one; the eight files of `src/` here are added to that
+  line, and to the three `cancho test` lines only if a test wants them. (`cancho add`, [`design.md`](design.md)
+  section 9, is the other way, and needs the kernel to have a `cancho.toml`, which it does not **[read]**.)
+- **Memory.** The shell's region holds its buffers already, about 12 KB **[read]**. A connection is
+  `ssh.ints_len()` words (1,024 bytes) and `ssh.bytes_len(4096)` bytes (9,288), or 17,480 for packets of 8,192. A
+  region is one 64 KiB chunk, so both fit beside what is there; if they come not to, a second region inside the
+  first is the way.
+- **Authority.** The package holds no capability and `session` holds none **[read]**, so `./authority.sh` should
+  still say "as recorded". That is the kernel's check to run, and a difference is a finding.
+- **The window is 256 bytes.** A connection's inbox is `tcp_inbox()` = 256 bytes and its window is the room in it
+  **[read]**. A client's KEXINIT is about 1,500 bytes, so the handshake arrives in six or more segments. That is
+  slow, not wrong: `feed` takes whatever it is given.
+- **Echo.** The shell does not echo ("Not a terminal", `docs/network.md` section 8) **[read]**. An SSH client that
+  asked for a terminal echoes nothing itself, so either the glue echoes when `ssh.terminal(ints)` is true, or
+  people use `ssh -T`. `examples/sshd/shell.cho` is the first choice written out.
+- **The test.** `MACHINE=virt` already forwards a host port to the kernel's port 23 for `nc` **[read]**; the same
+  line with port 22 lets OpenSSH's client log in to the kernel in QEMU, in the kernel's own CI.
 
-## 4. What the kernel does not need
+## 3. What is in the way
 
-No heap, no threads, no interrupts (the loop polls), no file system, no clock of the day (SSH carries no dates), no
-floating point.
+1. **The Pi 4 has no random numbers.** `docs/random.md`: the RNG200 at `0xfe104000` is not driven, QEMU's Pi 4
+   does not have it, and the kernel "falls back to the counter" **[read]**. A counter is fine for nothing here:
+   with predictable entropy the ephemeral keys are predictable and every session can be decrypted afterwards.
+   **SSH must refuse to start when the pool is not from a generator** (`k[34] == 0`), and so on a Pi 4 there is no
+   SSH until that driver exists and has been tried on the board. On QEMU's `virt` and the Pi 3 there is one.
+2. **Thirty-two bytes a connection, from a pool of sixteen words.** `ssh.start` wants 32 bytes: eight words of
+   the pool, used once and never printed (the kernel's own rule) **[read]**. `docs/random.md` also says the
+   hardware is believed as it comes, with no health test.
+3. **A host key with nowhere to live.** The kernel has no storage driver **[read]**. A seed compiled into the
+   image is the same on every board and public if the image is. A seed drawn at every boot makes every client's
+   `known_hosts` wrong after every restart, which teaches people to ignore the warning. A seed drawn at first
+   boot needs an SD card driver. This is the kernel's decision; the package takes whatever 32 bytes it is given.
+   For QEMU and CI, drawing one at boot and printing its public key on the serial console is enough.
+4. **Who may log in.** There is no file to read, so the allowed keys are a table in the image: 32 bytes each,
+   end to end, for `ssh.key_listed`.
+5. **`std.crypto.sha256` on the bare target.** It does not build there, which is why this package carries
+   `src/sha256.cho` ([`design.md`](design.md) section 1). Nothing for the kernel to do; if cancho changes, the file
+   goes.
 
-## 5. Open, on the cancho side
+## 4. The two rules of the loop
 
-`std.crypto.sha256` does not build for the bare target (it asks for the CPU's SHA instructions through a builtin
-that is refused there), which is why this package carries `src/sha256.cho`. If cancho makes that builtin answer
-"no" on the bare target, or uses the instructions there, the file can go and the kernel gets hardware SHA-256.
+Both were found by getting them wrong in `tests/probes/bare.cho`, and `session` is built so that the first is
+natural and the second is easy to miss:
+
+1. **Read the network only when nothing else moved.** `session` already writes before it reads **[read]**; keep
+   that order.
+2. **Keep what `feed` did not take, and what `tcp_write` did not take.** `feed` answers how many bytes it took.
+   `session` today reads one byte at a time and so never has a remainder; with SSH it should read into a buffer,
+   and the bytes `feed` leaves must be given again on the next turn. Dropping them desynchronises the stream, and
+   the connection then waits for ever for a packet whose tail is gone. The same holds outwards: call `ssh.sent`
+   with what `tcp_write` took, not with what was offered.
+
+## 5. What the kernel does not need
+
+No heap, no threads, no interrupts (the loop polls, as the kernel does), no file system, no clock of the day, no
+floating point, and no new capability.
