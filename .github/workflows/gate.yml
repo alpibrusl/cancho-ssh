@@ -1,0 +1,33 @@
+name: gate
+on: [push, pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: tools
+        # clang builds the compiler and every program; the clients are what `interop` logs in with; the cross
+        # compiler and qemu run the object built for aarch64-none-elf (`scripts/bare_run.py`)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm openssh-client dropbear-bin qemu-user gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          python3 -m pip install --break-system-packages cryptography asyncssh paramiko
+      - name: which compiler
+        # the revision the sources were written for is the one in cancho.toml
+        id: pin
+        run: echo "rev=$(sed -n 's/^cancho = "\(.*\)"/\1/p' cancho.toml)" >> "$GITHUB_OUTPUT"
+      - name: the compiler, kept from the last run
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/cancho-out/cancho
+          key: cancho-${{ runner.os }}-${{ steps.pin.outputs.rev }}
+      - name: cancho, built from its seed by itself
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone https://github.com/alpibrusl/cancho /tmp/cancho
+          git -C /tmp/cancho checkout "${{ steps.pin.outputs.rev }}"
+          sh /tmp/cancho/scripts/build-standalone.sh --seed --out /tmp/cancho-out --rev "${{ steps.pin.outputs.rev }}"
+      - name: the gate
+        run: sh scripts/gate.sh --cancho /tmp/cancho-out/cancho

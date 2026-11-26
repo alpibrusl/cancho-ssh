@@ -154,8 +154,42 @@ pub fn i_sha() -> [] int {
     return 32;
 }
 
-pub fn ints_len() -> [] int {
+// The cipher each way (`cipher_chacha` or `cipher_gcm`), in use and agreed for after NEWKEYS.
+pub fn i_read_cipher() -> [] int {
+    return 122;
+}
+
+pub fn i_write_cipher() -> [] int {
+    return 123;
+}
+
+pub fn i_next_read_cipher() -> [] int {
+    return 124;
+}
+
+pub fn i_next_write_cipher() -> [] int {
+    return 125;
+}
+
+// The prepared AES-GCM key each way, `cipher.gcm_context_len()` words each.
+pub fn i_read_gcm() -> [] int {
     return 128;
+}
+
+pub fn i_write_gcm() -> [] int {
+    return 128 + cipher.gcm_context_len();
+}
+
+pub fn ints_len() -> [] int {
+    return 128 + 2 * cipher.gcm_context_len();
+}
+
+pub fn cipher_chacha() -> [] int {
+    return 1;
+}
+
+pub fn cipher_gcm() -> [] int {
+    return 2;
 }
 
 // ---- Phases, the key exchange, questions, flags ----
@@ -295,6 +329,8 @@ pub fn b_session_id() -> [] int {
     return 96;
 }
 
+// A key each way, 64 bytes of room. ChaCha20-Poly1305 uses all 64. AES-GCM keeps its nonce at 32..44 (four fixed
+// bytes and the counter); its 32 key bytes at 0..32 are cleared once the key is prepared in `ints`.
 pub fn b_read_key() -> [] int {
     return 128;
 }
@@ -354,9 +390,10 @@ pub fn packet_max() -> [] int {
     return 35000;
 }
 
-// What a packet costs on the wire beyond its payload, at most: the length, the padding and its length, the tag.
+// What a packet costs on the wire beyond its payload, at most: the length (4), the padding's length (1), the
+// padding (19 at most, to a block of 16), the tag (16).
 pub fn overhead() -> [] int {
-    return 36;
+    return 40;
 }
 
 // How long `bytes` must be for packets of at most `packet` bytes.
@@ -438,9 +475,10 @@ pub fn next_packet[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
     }
     let protected = has(ints, f_read_protected());
     let seq = ints[i_read_seq()];
+    let gcm = protected && ints[i_read_cipher()] == cipher_gcm();
     var n = ints[i_packet_len()];
     if n < 0 {
-        if protected {
+        if protected && !gcm {
             n = cipher.open_length(bytes[b_read_key()..b_read_key() + 64], seq, bytes[at..at + 4]);
         } else {
             n = wire.u32_at(bytes, at);
@@ -449,20 +487,30 @@ pub fn next_packet[&i, &b](ints: &!i [int], bytes: &!b [byte]) -> [] int {
     }
     var total = 4 + n;
     var multiple = total;
+    var block = 8;
     if protected {
         total = 4 + n + 16;
         multiple = n;
     }
+    if gcm {
+        block = 16;
+    }
     if n > cap(ints) - 20 {
         return wire.packet_too_large();
     }
-    if n < 8 || multiple % 8 != 0 {
+    if n < 8 || multiple % block != 0 {
         return wire.packet_malformed();
     }
     if have < total {
         return 0;
     }
-    if protected {
+    if gcm {
+        let opened = cipher.gcm_open(ints[i_read_gcm()..i_read_gcm() + cipher.gcm_context_len()], bytes[b_read_key() + 32..b_read_key() + 44], bytes[at..at + total]);
+        if opened < 0 {
+            return opened;
+        }
+        cipher.gcm_next(bytes[b_read_key() + 32..b_read_key() + 44]);
+    } else if protected {
         let opened = cipher.open(bytes[b_read_key()..b_read_key() + 64], seq, bytes[at..at + total]);
         if opened < 0 {
             return opened;
@@ -545,13 +593,17 @@ pub fn queue_line[&i, &b, &l](ints: &!i [int], bytes: &!b [byte], line: &l [byte
 pub fn packet_size[&i](ints: &i [int], n: int) -> [] int {
     var counted = 4 + 1 + n;
     var extra = 0;
+    var block = 8;
     if has(ints, f_write_protected()) {
         counted = 1 + n;
         extra = 4 + 16;
+        if ints[i_write_cipher()] == cipher_gcm() {
+            block = 16;
+        }
     }
-    var pad = 8 - counted % 8;
+    var pad = block - counted % block;
     if pad < 4 {
-        pad = pad + 8;
+        pad = pad + block;
     }
     return counted + pad + extra;
 }
@@ -585,7 +637,10 @@ pub fn queue_packet2[&i, &b, &h, &t](ints: &!i [int], bytes: &!b [byte], head: &
         bytes[at + 5 + n + k] = byte_of(0);
         k = k + 1;
     }
-    if protected {
+    if protected && ints[i_write_cipher()] == cipher_gcm() {
+        cipher.gcm_seal(ints[i_write_gcm()..i_write_gcm() + cipher.gcm_context_len()], bytes[b_write_key() + 32..b_write_key() + 44], bytes[at..at + total]);
+        cipher.gcm_next(bytes[b_write_key() + 32..b_write_key() + 44]);
+    } else if protected {
         cipher.seal(bytes[b_write_key()..b_write_key() + 64], seq, bytes[at..at + total]);
     }
     ints[i_write_seq()] = seq + 1;

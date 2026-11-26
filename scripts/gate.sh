@@ -100,7 +100,7 @@ if wanted tests; then
   done <<LIST
 tests/sha256_test.cho 5
 tests/wire_test.cho 6
-tests/cipher_test.cho 4
+tests/cipher_test.cho 7
 tests/server_test.cho 19
 LIST
 fi

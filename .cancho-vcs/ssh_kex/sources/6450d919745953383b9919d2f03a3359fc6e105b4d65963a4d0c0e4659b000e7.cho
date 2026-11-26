@@ -8,7 +8,7 @@ import ssh_slot as slot;
 import ssh_wire as wire;
 
 // `ssh_kex` -- the key exchange (RFC 4253 sections 7 and 8, RFC 8731, RFC 5656 section 4): KEXINIT both ways,
-// `curve25519-sha256`, the exchange hash signed with the host key, the keys of the cipher, NEWKEYS, and OpenSSH's
+// `curve25519-sha256`, the exchange hash signed with the host key, the keys of the two ciphers, NEWKEYS, and OpenSSH's
 // strict key exchange. The first exchange and a re-key the client starts are the same code.
 //
 // The ephemeral secret, the shared secret and the keys are secret. The shared secret's leading zero bytes decide
@@ -35,11 +35,35 @@ pub fn host_key_name() -> [] &static [byte] {
     return "ssh-ed25519";
 }
 
-fn cipher_name() -> [] &static [byte] {
-    return "chacha20-poly1305@openssh.com";
+fn cipher_names() -> [] &static [byte] {
+    return "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com";
 }
 
-// Never chosen: the one cipher has a tag of its own, and the MAC negotiated beside it is not used (OpenSSH's
+// The cipher a client that lists `names` gets: the first of its names that this server has (RFC 4253 section
+// 7.1: the client's order decides), or 0.
+fn cipher_of[&l](names: &l [byte]) -> [] int {
+    var chosen = 0;
+    var from = 0;
+    var i = 0;
+    while i <= len(names) && chosen == 0 {
+        var at_end = i == len(names);
+        if !at_end {
+            at_end = int_of(names[i]) == ',';
+        }
+        if at_end {
+            if wire.equal(names[from..i], "chacha20-poly1305@openssh.com") {
+                chosen = slot.cipher_chacha();
+            } else if wire.equal(names[from..i], "aes256-gcm@openssh.com") {
+                chosen = slot.cipher_gcm();
+            }
+            from = i + 1;
+        }
+        i = i + 1;
+    }
+    return chosen;
+}
+
+// Never chosen: both ciphers have a tag of their own, and the MAC negotiated beside it is not used (OpenSSH's
 // PROTOCOL.chacha20poly1305). A name is offered because some clients refuse a server that offers none.
 fn mac_name() -> [] &static [byte] {
     return "hmac-sha2-256";
@@ -52,8 +76,8 @@ fn our_kexinit[&b, &o](bytes: &b [byte], out: &!o [byte]) -> [] int {
     at = wire.put_bytes(out, at, bytes[slot.b_cookie()..slot.b_cookie() + 16]);
     at = wire.put_string(out, at, kex_names());
     at = wire.put_string(out, at, host_key_name());
-    at = wire.put_string(out, at, cipher_name());
-    at = wire.put_string(out, at, cipher_name());
+    at = wire.put_string(out, at, cipher_names());
+    at = wire.put_string(out, at, cipher_names());
     at = wire.put_string(out, at, mac_name());
     at = wire.put_string(out, at, mac_name());
     at = wire.put_string(out, at, "none");
@@ -125,8 +149,16 @@ pub fn on_kexinit[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int) -
                     guess_right = false;
                 }
             }
-            if list == 2 || list == 3 {
-                if !wire.listed(names, cipher_name()) {
+            if list == 2 {
+                // Client to server: what this server reads.
+                ints[slot.i_next_read_cipher()] = cipher_of(names);
+                if ints[slot.i_next_read_cipher()] == 0 {
+                    agreed = false;
+                }
+            }
+            if list == 3 {
+                ints[slot.i_next_write_cipher()] = cipher_of(names);
+                if ints[slot.i_next_write_cipher()] == 0 {
                     agreed = false;
                 }
             }
@@ -204,6 +236,36 @@ fn derive[&st, &k, &h, &s, &o](st: &!st [int], k: &k [byte], h: &h [byte], sessi
     return sha.final(st, out[32..64]);
 }
 
+// The key of one direction, into the 64 bytes at `at`. ChaCha20-Poly1305: the 64 bytes of `key_letter`. AES-GCM:
+// 32 bytes of `key_letter`, then at 32 the 12-byte nonce, which is the first 12 bytes of `iv_letter`.
+fn next_key[&st, &k, &h, &b](st: &!st [int], k: &k [byte], h: &h [byte], bytes: &!b [byte], iv_letter: int, key_letter: int, which: int, at: int) -> [] int {
+    region r {
+        let session = alloc_slice[r](32, byte_of(0));
+        let made = alloc_slice[r](64, byte_of(0));
+        copy_into(session, bytes[slot.b_session_id()..slot.b_session_id() + 32]);
+        derive(st, k, h, session, key_letter, bytes[at..at + 64]);
+        if which == slot.cipher_gcm() {
+            derive(st, k, h, session, iv_letter, made);
+            copy_into(bytes[at + 32..at + 44], made[0..12]);
+            slot.zero(bytes, at + 44, 20);
+            slot.zero(made, 0, 64);
+        }
+    }
+    return 0;
+}
+
+// Puts the key at `from` in use at `to`, for the cipher `which`: an AES-GCM key is prepared into the `ctx` words
+// of `ints`, and its bytes cleared.
+fn install[&i, &b](ints: &!i [int], bytes: &!b [byte], from: int, to: int, which: int, ctx: int) -> [] int {
+    copy_into(bytes[to..to + 64], bytes[from..from + 64]);
+    slot.zero(bytes, from, 64);
+    if which == slot.cipher_gcm() {
+        cipher.gcm_prepare(bytes[to..to + 32], ints[ctx..ctx + cipher.gcm_context_len()]);
+        slot.zero(bytes, to, 32);
+    }
+    return 0;
+}
+
 // The client's key share (`SSH_MSG_KEX_ECDH_INIT`), the payload of `n` bytes at `at`: this server's share, the
 // exchange hash and its signature, the reply and NEWKEYS, and the new keys. The reply and NEWKEYS go out under the
 // keys in use; what follows them is under the new one.
@@ -244,8 +306,8 @@ pub fn on_ecdh_init[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int)
                 copy_into(bytes[slot.b_session_id()..slot.b_session_id() + 32], h);
             }
             ed25519.sign_with_public(bytes[slot.b_seed()..slot.b_seed() + 32], bytes[slot.b_host_public()..slot.b_host_public() + 32], h, sig);
-            derive(work, k, h, bytes[slot.b_session_id()..slot.b_session_id() + 32], 'C', bytes[slot.b_next_read()..slot.b_next_read() + 64]);
-            derive(work, k, h, bytes[slot.b_session_id()..slot.b_session_id() + 32], 'D', bytes[slot.b_next_write()..slot.b_next_write() + 64]);
+            next_key(work, k, h, bytes, 'A', 'C', ints[slot.i_next_read_cipher()], slot.b_next_read());
+            next_key(work, k, h, bytes, 'B', 'D', ints[slot.i_next_write_cipher()], slot.b_next_write());
             sha.forget(work);
             slot.zero(k, 0, 32);
             var p = wire.put_byte(reply, 0, wire.msg_kex_ecdh_reply());
@@ -264,8 +326,8 @@ pub fn on_ecdh_init[&i, &b](ints: &!i [int], bytes: &!b [byte], at: int, n: int)
     if result < 0 {
         return result;
     }
-    copy_into(bytes[slot.b_write_key()..slot.b_write_key() + 64], bytes[slot.b_next_write()..slot.b_next_write() + 64]);
-    slot.zero(bytes, slot.b_next_write(), 64);
+    ints[slot.i_write_cipher()] = ints[slot.i_next_write_cipher()];
+    install(ints, bytes, slot.b_next_write(), slot.b_write_key(), ints[slot.i_write_cipher()], slot.i_write_gcm());
     slot.set_flag(ints, slot.f_write_protected());
     if slot.has(ints, slot.f_strict()) {
         ints[slot.i_write_seq()] = 0;
@@ -282,8 +344,8 @@ pub fn on_newkeys[&i, &b](ints: &!i [int], bytes: &!b [byte], n: int) -> [] int 
     if n != 1 {
         return wire.decode();
     }
-    copy_into(bytes[slot.b_read_key()..slot.b_read_key() + 64], bytes[slot.b_next_read()..slot.b_next_read() + 64]);
-    slot.zero(bytes, slot.b_next_read(), 64);
+    ints[slot.i_read_cipher()] = ints[slot.i_next_read_cipher()];
+    install(ints, bytes, slot.b_next_read(), slot.b_read_key(), ints[slot.i_read_cipher()], slot.i_read_gcm());
     slot.set_flag(ints, slot.f_read_protected());
     if slot.has(ints, slot.f_strict()) {
         ints[slot.i_read_seq()] = 0;

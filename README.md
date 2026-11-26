@@ -19,27 +19,27 @@ cancho> whoami
 you
 ```
 
-**Status: it works against real clients, and nobody but its author has read it.** OpenSSH 9.6, asyncssh 2.24 and
-Dropbear 2022.83 log in, run commands, get exit statuses and survive re-keying; the object built for the bare
-target does the same when run on AArch64 under qemu. It has not been reviewed, has not been run on a Raspberry Pi
+**Status: it works against real clients, and nobody but its author has read it.** OpenSSH 9.6, asyncssh 2.24,
+Dropbear 2022.83 and paramiko 5.1 log in and run commands; OpenSSH also gets exit statuses and shells and survives
+re-keying under both ciphers. The object built for the bare target does the same for OpenSSH when run on AArch64
+under qemu. It has not been reviewed, has not been run on a Raspberry Pi
 or on macOS (the gate was run on Linux x86-64), and should not guard anything yet. [`docs/design.md`](docs/design.md) says what was decided, what was measured and
 what is not done.
 
 ## What it speaks
 
-One algorithm of each kind, all of them already in cancho's standard library:
+One algorithm of each kind and a second cipher, all of them already in cancho's standard library:
 
 | | |
 |---|---|
 | key exchange | `curve25519-sha256` |
 | host key | `ssh-ed25519` |
-| cipher | `chacha20-poly1305@openssh.com` |
+| cipher | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com` |
 | user authentication | `publickey`, with `ssh-ed25519` keys |
 | channels | one `session` at a time: a shell or a command, with or without a terminal |
 
 with OpenSSH's strict key exchange (the Terrapin countermeasure) and re-keying when the client asks. No passwords,
-no forwarding, no SFTP. A client that shares no algorithm is refused and told why; paramiko, which has no ChaCha20
-cipher, is one.
+no forwarding, no SFTP. A client that shares no algorithm is refused and told why.
 
 ## Using it
 

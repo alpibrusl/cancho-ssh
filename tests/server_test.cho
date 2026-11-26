@@ -209,10 +209,15 @@ fn test_packets_with_a_bad_length_or_padding_are_refused() -> [] int {
         ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
         p[4] = byte_of(11);
         test.assert_eq(ssh.feed(ints, bytes, p[0..16]), wire.packet_malformed());
-        // One byte more than the buffers were sized for.
+        // The longest packet the buffers were sized for is waited for; four bytes more is refused.
         begin(ints, bytes);
         ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
         wire.put_u32(p, 0, ssh.packet_min() + 20);
+        p[4] = byte_of(4);
+        test.assert_eq(ssh.feed(ints, bytes, p[0..8]), 8);
+        begin(ints, bytes);
+        ssh.feed(ints, bytes, "SSH-2.0-t\r\n");
+        wire.put_u32(p, 0, ssh.packet_min() + 24);
         test.assert_eq(ssh.feed(ints, bytes, p[0..8]), wire.packet_too_large());
     }
     return 0;

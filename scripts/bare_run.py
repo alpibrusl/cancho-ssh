@@ -95,6 +95,7 @@ def main():
 
         session("the bare object, on AArch64, runs a command for OpenSSH", ["root@127.0.0.1", "echo", "from the bare target"], b"", 0, b"from the bare target\n")
         session("it runs a shell and passes its exit status", ["-T", "root@127.0.0.1"], b"whoami\nexit 9\n", 9, b"root\n")
+        session("it does the same over AES-256-GCM", ["-o", "Ciphers=aes256-gcm@openssh.com", "root@127.0.0.1", "echo", "gcm"], b"", 0, b"gcm\n")
         lines = b"".join(b"echo line %05d\n" % i for i in range(3000))
         session("it survives re-keying", ["-T", "-o", "RekeyLimit=16K", "root@127.0.0.1"], lines, 0, b"".join(b"line %05d\n" % i for i in range(3000)))
     finally:

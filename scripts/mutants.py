@@ -19,7 +19,7 @@ from sshd_fixture import cancho  # noqa: E402
 
 UNIT = "unit"
 MUTANTS = [
-    ("the tag of a packet is not compared", "src/cipher.cho", "    if diff != 0 {\n        return wire.bad_mac();\n    }\n    return 0;\n}\n\n// ---- The generator", "    return 0;\n}\n\n// ---- The generator", "hostile.py"),
+    ("the tag of a packet is not compared", "src/cipher.cho", "    if diff != 0 {\n        return wire.bad_mac();\n    }\n    return 0;\n}\n\n// ---- aes256-gcm", "    return 0;\n}\n\n// ---- aes256-gcm", "hostile.py"),
     ("a packet with a bad tag is decrypted all the same", "src/cipher.cho", "        if diff == 0 {\n            chacha20.xor(key[0..32], 1, nonce, buf[4..body], buf[4..body]);\n        }", "        chacha20.xor(key[0..32], 1, nonce, buf[4..body], buf[4..body]);\n        diff = 0;", "hostile.py"),
     ("any signature logs in", "src/auth.cho", "bytes[at + sig + 23..at + sig + 87]) == 1;", "bytes[at + sig + 23..at + sig + 87]) >= 0;", "hostile.py"),
     ("the signature is not over the session identifier", "src/auth.cho", "let p = wire.put_string(signed, 0, bytes[slot.b_session_id()..slot.b_session_id() + 32]);", "let p = wire.put_string(signed, 0, bytes[slot.b_cookie()..slot.b_cookie() + 32]);", "interop.py"),
@@ -38,6 +38,11 @@ MUTANTS = [
     ("the connection protocol is open before a login", "src/server.cho", "    if kind >= 80 && kind <= 100 && phase != slot.phase_open() {", "    if kind >= 80 && kind <= 100 && phase == slot.phase_ended() {", "hostile.py"),
     ("the window is never raised", "src/channel.cho", "    if owed < window() / 2 || !open_to_send(ints) || slot.out_free(ints) < 64 {", "    if owed >= 0 {", "interop.py"),
     ("the exchange hash leaves out this server's KEXINIT", "src/kex.cho", "        let m = our_kexinit(bytes, mine);\n        hash_string(st, mine[0..m]);", "        let m = our_kexinit(bytes, mine);\n        hash_string(st, mine[0..m - 1]);", "interop.py"),
+    ("AES-GCM: the tag is not looked at", "src/cipher.cho", "    if gcm.open_in_place_software(ctx, nonce[0..12], buf[0..4], buf[4..len(buf)]) != 0 {", "    if gcm.open_in_place_software(ctx, nonce[0..12], buf[0..4], buf[4..len(buf)]) > 0 {", "hostile.py"),
+    ("AES-GCM: the nonce does not move after a packet is opened", "src/slot.cho", "        cipher.gcm_next(bytes[b_read_key() + 32..b_read_key() + 44]);\n    } else if protected {\n        let opened", "    } else if protected {\n        let opened", "hostile.py"),
+    ("AES-GCM: the nonce does not move after a packet is sealed", "src/slot.cho", "        cipher.gcm_next(bytes[b_write_key() + 32..b_write_key() + 44]);\n", "", "interop.py"),
+    ("AES-GCM: the length is not part of what is authenticated", "src/cipher.cho", "    if gcm.open_in_place_software(ctx, nonce[0..12], buf[0..4], buf[4..len(buf)]) != 0 {", "    if gcm.open_in_place_software(ctx, nonce[0..12], buf[0..0], buf[4..len(buf)]) != 0 {", UNIT),
+    ("the cipher is the server's first, not the client's", "src/kex.cho", "    while i <= len(names) && chosen == 0 {", "    if wire.listed(names, \"chacha20-poly1305@openssh.com\") {\n        chosen = slot.cipher_chacha();\n    }\n    while i <= len(names) && chosen == 0 {", "interop.py"),
     ("SHA-256 rotates by one bit too few", "src/sha256.cho", "let s1 = rotr32(we, 6) ^ rotr32(we, 11) ^ rotr32(we, 25);", "let s1 = rotr32(we, 6) ^ rotr32(we, 11) ^ rotr32(we, 24);", UNIT),
 ]
 

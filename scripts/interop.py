@@ -88,6 +88,18 @@ def main():
         check("output survives %d re-keys" % rekeys, r.returncode == 0 and r.stdout == expected and rekeys >= 5,
               repr((r.returncode, len(r.stdout), len(expected), rekeys, r.stderr[-400:])))
 
+        r = ssh(server, "echo", "gcm", options=["Ciphers=aes256-gcm@openssh.com"])
+        check("OpenSSH with AES-256-GCM runs a command", r.returncode == 0 and r.stdout == b"gcm\n"
+              and r.stderr.count(b"cipher: aes256-gcm@openssh.com") == 2, repr((r.returncode, r.stdout, r.stderr[-400:])))
+        # Both ciphers offered, this server's second one first: the client's order decides (RFC 4253 section 7.1).
+        r = ssh(server, "echo", "order", options=["Ciphers=aes256-gcm@openssh.com,chacha20-poly1305@openssh.com"])
+        check("a client that lists AES-GCM first gets it", r.returncode == 0 and r.stdout == b"order\n"
+              and r.stderr.count(b"cipher: aes256-gcm@openssh.com") == 2, repr((r.returncode, r.stdout, r.stderr[-400:])))
+        r = ssh(server, "-T", stdin=lines, options=["RekeyLimit=32K", "Ciphers=aes256-gcm@openssh.com"], verbose="-vv", timeout=180)
+        rekeys = r.stderr.count(b"SSH2_MSG_NEWKEYS sent") - 1
+        check("with AES-256-GCM, output survives %d re-keys" % rekeys, r.returncode == 0 and r.stdout == expected and rekeys >= 5,
+              repr((r.returncode, len(r.stdout), len(expected), rekeys, r.stderr[-400:])))
+
         # The window: 3 MiB in, three times what the window is, so it must be raised for the input to arrive.
         big = b"# " + b"x" * 125 + b"\n"
         r = ssh(server, "-T", stdin=big * (3 * 1024 * 1024 // len(big)) + b"echo done\n", timeout=180)
@@ -128,8 +140,7 @@ def main():
                                env=dict(os.environ, HOME=home), input=b"", capture_output=True, timeout=30)
             check("dropbear's client logs in and runs a command", r.returncode == 0 and r.stdout == b"dave\n", repr((r.returncode, r.stdout, r.stderr[-300:])))
 
-        # paramiko has no chacha20-poly1305, the one cipher offered (`docs/design.md` section 3): the two must part
-        # at the algorithm negotiation, and the server must say why.
+        # paramiko has no ChaCha20 cipher: it is the client that needs AES-GCM (`docs/design.md` section 3).
         try:
             import paramiko
         except ImportError:
@@ -139,20 +150,21 @@ def main():
         else:
             import logging
             logging.getLogger("paramiko").setLevel(logging.CRITICAL)
-            before = len(server.ended(0))
             client = paramiko.SSHClient()
             client.load_host_keys(server.known_hosts)
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
-            refused = ""
             try:
                 client.connect("127.0.0.1", port=server.port, username="bob", key_filename=server.identity, allow_agent=False, look_for_keys=False, timeout=20)
+                _, stdout, _ = client.exec_command("whoami")
+                out = stdout.read()
+                status = stdout.channel.recv_exit_status()
+                cipher = client.get_transport().remote_cipher
+                check("paramiko %s logs in over AES-256-GCM and runs a command" % paramiko.__version__,
+                      out == b"bob\n" and status == 0 and cipher == "aes256-gcm@openssh.com", repr((out, status, cipher)))
             except Exception as e:  # noqa: BLE001
-                refused = repr(e)
+                check("paramiko %s logs in over AES-256-GCM and runs a command" % paramiko.__version__, False, repr(e))
             finally:
                 client.close()
-            reasons = server.ended(before + 1)
-            check("paramiko %s, which lacks the cipher, is refused at the negotiation" % paramiko.__version__,
-                  "no acceptable ciphers" in refused and reasons[before:] == ["ssh-no-common-algorithm"], repr((refused, reasons[before:])))
 
         check("the server is still running", server.alive(), server.log()[-600:])
         reasons = server.ended(1)
